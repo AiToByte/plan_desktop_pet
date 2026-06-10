@@ -1,0 +1,55 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+venv/
+.venv/
+env/
+.env
+
+# === PlatformIO ===
+.pio/
+.pioenvs/
+.piolibdeps/
+.pio/
+lib/
+test/
+
+# === Logs ===
+*.log
+agent_status.log
+weather_cache.json
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+
+# === OS ===
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# === Project specific ===
+# Config with local paths (use config.example.json as template)
+pc_monitor/config/config.json
+pc_monitor/config/*.json
+
+# Pixel tool cache
+pixel_tool/__pycache__/
+pixel_tool/*.pyc
+
+# Build outputs
+*.bin
+*.elf
+*.hex
