@@ -107,6 +107,7 @@ public:
 
 private:
     LGFX _lcd;
+    LGFX_Sprite _sprite;  // 双缓冲：离屏画布，消除闪烁
     uint8_t _currentStatus;
     uint8_t _animFrame;
     unsigned long _lastAnimTime;

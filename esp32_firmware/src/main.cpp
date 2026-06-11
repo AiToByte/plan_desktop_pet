@@ -95,6 +95,11 @@ void loop() {
     
     // 检查连接状态
     if (!comm.isConnected() && wifi.isConnected()) {
+        // 断连时清理像素状态，释放内存
+        extern uint8_t* pxlBuffer;
+        extern size_t pxlCapacity;
+        if (pxlBuffer) { free(pxlBuffer); pxlBuffer = nullptr; pxlCapacity = 0; }
+        display.setNormalMode();
         comm.reconnect();
     }
     

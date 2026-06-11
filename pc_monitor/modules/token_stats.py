@@ -113,8 +113,16 @@ class TokenTracker:
         return records
     
     def get_stats(self) -> TokenStats:
-        """获取Token统计"""
+        """获取Token统计（带缓存，避免频繁全量扫描）"""
+        now = time.time()
+        # 10秒内返回缓存
+        if (self._cached_stats and 
+            now - self._last_scan_time < 10 and 
+            self._last_scan_time > 0):
+            return self._cached_stats
+
         records = self._scan_log_files()
+        self._last_scan_time = now
         now = time.time()
         
         total_input = sum(r["input_tokens"] for r in records)
@@ -155,4 +163,5 @@ class TokenTracker:
         })
         self._save_cache()
         
+        self._cached_stats = stats
         return stats

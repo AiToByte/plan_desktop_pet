@@ -40,6 +40,9 @@ class AgentMonitor:
         self.check_interval = config.get("check_interval", 2)
         self._running = False
         self._current_state = None
+        self._last_cpu_time = 0
+        self._cpu_history = []
+        self._idle_streak = 0
         
     def _find_agent_process(self) -> Optional[psutil.Process]:
         """查找Agent进程"""
@@ -55,18 +58,40 @@ class AgentMonitor:
                 continue
         return None
     
+    def __init_cpu(self):
+        """初始化非阻塞CPU采样（首次调用需预热）"""
+        self._last_cpu_time = 0
+        self._cpu_history = []  # 最近N次CPU采样
+        self._idle_streak = 0   # 连续低CPU计数
+
     def _analyze_cpu_pattern(self, proc: psutil.Process) -> AgentStatus:
-        """通过CPU使用模式判断Agent状态"""
+        """通过CPU使用模式判断Agent状态（非阻塞）"""
         try:
-            cpu_percent = proc.cpu_percent(interval=0.5)
-            
-            if cpu_percent > 50:
+            # 非阻塞调用：首次返回0，后续返回自上次调用以来的CPU%
+            cpu_percent = proc.cpu_percent(interval=0)
+            now = time.time()
+
+            # 维护滑动窗口（最近5个采样点）
+            self._cpu_history.append(cpu_percent)
+            if len(self._cpu_history) > 5:
+                self._cpu_history.pop(0)
+
+            avg_cpu = sum(self._cpu_history) / len(self._cpu_history)
+
+            if avg_cpu > 30:
+                self._idle_streak = 0
                 return AgentStatus.WORKING
-            elif cpu_percent > 5:
-                return AgentStatus.AUTHORIZING  # 低CPU可能在等待输入
+            elif avg_cpu > 3:
+                self._idle_streak = 0
+                return AgentStatus.AUTHORIZING  # 低CPU=等待输入/授权
             else:
-                return AgentStatus.IDLE
-                
+                self._idle_streak += 1
+                # 连续6次低CPU（~12秒）才确认IDLE，避免误判
+                if self._idle_streak >= 6:
+                    return AgentStatus.IDLE
+                else:
+                    return AgentStatus.AUTHORIZING
+
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             return AgentStatus.OFFLINE
     
