@@ -88,7 +88,8 @@ private:
 
     // 辅助方法
     bool validateHeader(const uint8_t* data, size_t len) const;
-    size_t getFrameSize() const { return _header.width * _header.height * 2; }
+    // [Step 6] 显式size_t转换，防止uint16_t乘法溢出
+    size_t getFrameSize() const { return (size_t)_header.width * (size_t)_header.height * 2; }
     bool rleDecompress(const uint8_t* compressed, size_t compLen, uint16_t* output, size_t pixelCount);
 };
 

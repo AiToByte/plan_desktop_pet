@@ -20,9 +20,10 @@
 #include <esp_sleep.h>
 #include "driver/rtc_io.h"
 
-// ============ 共享数据 (mutex保护) ============
-DisplayData g_displayData;
-SemaphoreHandle_t g_dataMutex;
+// ============ 共享数据 (双缓冲+atomic指针交换，无mutex阻塞) ============
+DisplayData g_displayBuf[2];           // 双缓冲：front=read, back=write
+std::atomic<int> g_frontIdx{0};        // 原子索引：0或1，标识当前front buffer
+std::atomic<bool> g_forceWake{false};  // 原子标志：通信收到数据时强制唤醒
 
 // 像素缓冲区（通信任务写入，渲染任务读取）
 // PSRAM静态预分配池：32x32x2x64 = 128KB，避免运行时malloc碎片化
@@ -50,7 +51,7 @@ unsigned long g_lastDataReceived = 0;  // 最后收到有效数据的时间
 unsigned long g_screenSleepStart = 0;  // 进入屏幕休眠的时间（用于Light Sleep计时）
 bool g_screenDimmed = false;
 bool g_screenSleeping = false;
-bool g_forceWake = false;  // 通信收到数据时强制唤醒
+// g_forceWake 已移至上方atomic声明
 // Core 0 → Core 1 显示操作待处理标志（避免跨核直接调LCD/SPI）
 // 使用std::atomic确保双核SMP架构下的内存强一致性
 std::atomic<bool> g_pendingNormalMode{false};
@@ -91,24 +92,29 @@ void commTask(void* pvParameters) {
             String json = comm.getData();
             parseServerData(json);
             
-            // 更新连接状态（mutex保护）
-            if (xSemaphoreTake(g_dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                g_displayData.connected = true;
-                g_displayData.lastUpdate = now;
+            // [Step 5] 双缓冲写入：更新连接状态
+            {
+                int backIdx = 1 - g_frontIdx.load(std::memory_order_acquire);
+                g_displayBuf[backIdx] = g_displayBuf[g_frontIdx.load(std::memory_order_acquire)];
+                g_displayBuf[backIdx].connected = true;
+                g_displayBuf[backIdx].lastUpdate = now;
                 g_lastDataReceived = now;
                 isOffline = false;
-                g_forceWake = true;  // 通知渲染任务唤醒屏幕
-                xSemaphoreGive(g_dataMutex);
+                g_forceWake.store(true, std::memory_order_release);  // 通知渲染任务唤醒屏幕
+                g_frontIdx.store(backIdx, std::memory_order_release);
             }
         }
 
         // 离线检测：45秒无数据 → OFFLINE
         if (!isOffline && (now - g_lastDataReceived > OFFLINE_TIMEOUT_MS)) {
-            if (xSemaphoreTake(g_dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                g_displayData.connected = false;
-                g_displayData.agent.status = STATUS_OFFLINE;
+            // [Step 5] 双缓冲：标记离线
+            {
+                int backIdx = 1 - g_frontIdx.load(std::memory_order_acquire);
+                g_displayBuf[backIdx] = g_displayBuf[g_frontIdx.load(std::memory_order_acquire)];
+                g_displayBuf[backIdx].connected = false;
+                g_displayBuf[backIdx].agent.status = STATUS_OFFLINE;
                 isOffline = true;
-                xSemaphoreGive(g_dataMutex);
+                g_frontIdx.store(backIdx, std::memory_order_release);
             }
             Serial.println("[CommTask] 45s无数据，进入OFFLINE模式");
         }
@@ -119,7 +125,7 @@ void commTask(void* pvParameters) {
             if (digitalRead(0) == LOW) {
                 // 休眠状态下：唤醒屏幕显示15秒
                 if (g_screenSleeping) {
-                    g_forceWake = true;
+                    g_forceWake.store(true, std::memory_order_release);
                     Serial.println("[CommTask] BOOT键：唤醒屏幕(15s)");
                 }
                 // 普通状态下：停止像素播放
@@ -167,13 +173,10 @@ void renderTask(void* pvParameters) {
         unsigned long now = millis();
         bool needWake = false;
         
-        // 从共享数据复制到本地（快速mutex操作）
-        if (xSemaphoreTake(g_dataMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-            localData = g_displayData;
-            needWake = g_forceWake;
-            g_forceWake = false;
-            xSemaphoreGive(g_dataMutex);
-        }
+        // [Step 5] 原子指针交换：读front buffer，无需mutex
+        int frontIdx = g_frontIdx.load(std::memory_order_acquire);
+        localData = g_displayBuf[frontIdx];
+        needWake = g_forceWake.exchange(false, std::memory_order_acq_rel);
         
         // ===== 屏幕休眠管理 =====
         unsigned long timeSinceData = now - g_lastDataReceived;
@@ -217,7 +220,7 @@ void renderTask(void* pvParameters) {
                 setCpuFrequencyMhz(240);
                 g_screenSleeping = false;
                 g_screenDimmed = false;
-                g_forceWake = true;
+                g_forceWake.store(true, std::memory_order_release);
                 Serial.println("[Power] Woke from Light Sleep, CPU 240MHz");
             }
             vTaskDelay(pdMS_TO_TICKS(500));  // 未达Light Sleep阈值时低频轮询
@@ -297,6 +300,27 @@ void renderTask(void* pvParameters) {
             }
         }
         
+        // ===== [Step 7] 堆监控（每5秒打印PSRAM+Internal堆水位） =====
+        static unsigned long lastHeapLog = 0;
+        if (!g_screenSleeping && now - lastHeapLog >= 5000) {
+            lastHeapLog = now;
+            log_i("[Heap] Internal Free=%d B, MaxAlloc=%d B | PSRAM Free=%d B, MaxAlloc=%d B",
+                  ESP.getFreeHeap(), ESP.getMaxAllocHeap(),
+                  ESP.getFreePsram(), ESP.getMaxAllocPsram());
+        }
+        
+        // ===== [Step 8] FPS计数器（每秒输出实际渲染帧率） =====
+        static uint32_t fpsFrameCount = 0;
+        static unsigned long lastFpsReport = 0;
+        fpsFrameCount++;
+        if (now - lastFpsReport >= 1000) {
+            uint32_t elapsed = now - lastFpsReport;
+            float fps = fpsFrameCount * 1000.0f / elapsed;
+            log_i("[FPS] %.1f fps (%u frames in %lu ms)", fps, fpsFrameCount, elapsed);
+            fpsFrameCount = 0;
+            lastFpsReport = now;
+        }
+        
         // VRR动态帧率：根据状态调整延迟
         uint32_t frameDelay = 20;  // ACTIVE: 50fps
         if (g_screenSleeping) {
@@ -323,12 +347,8 @@ void setup() {
     Serial.println("桌面电子宠物 - ESP32-S3 (v2 Dual-Core)");
     Serial.println("================================");
     
-    // 创建互斥锁
-    g_dataMutex = xSemaphoreCreateMutex();
-    if (g_dataMutex == NULL) {
-        Serial.println("[INIT] FATAL: Mutex creation failed!");
-        while (1) delay(1000);  // 停机
-    }
+    // [Step 5] 双缓冲模式，无需互斥锁
+    Serial.println("[INIT] Double-buffer mode (no mutex needed)");
     
     // 初始化显示
     Serial.println("[INIT] 初始化显示...");
@@ -390,10 +410,11 @@ void setup() {
     Serial.println("[INIT] 初始化通信...");
     comm.begin();
     
-    // 初始化数据
-    g_displayData.agent.status = STATUS_OFFLINE;
-    g_displayData.connected = false;
-    g_displayData.lastUpdate = 0;
+    // 初始化数据（双缓冲：初始化front buffer）
+    int idx = g_frontIdx.load(std::memory_order_acquire);
+    g_displayBuf[idx].agent.status = STATUS_OFFLINE;
+    g_displayBuf[idx].connected = false;
+    g_displayBuf[idx].lastUpdate = 0;
     g_lastDataReceived = millis();
     
     delay(1000);
@@ -453,13 +474,16 @@ void parseServerData(String json) {
         if (error) { Serial.printf("[JSON] status parse error: %s\n", error.c_str()); return; }
         
         JsonObject data = doc["data"];
-        if (xSemaphoreTake(g_dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            g_displayData.agent.status = parseStatus(data["status"] | "offline");
-            g_displayData.agent.processName = data["process"] | "";
-            g_displayData.agent.cpuPercent = data["cpu"] | 0.0;
-            g_displayData.agent.memoryMB = data["memory"] | 0.0;
-            g_displayData.agent.uptimeSeconds = data["uptime"] | 0;
-            xSemaphoreGive(g_dataMutex);
+        // [Step 5] 双缓冲写入：copy front→back, 写back, atomic swap
+        {
+            int backIdx = 1 - g_frontIdx.load(std::memory_order_acquire);
+            g_displayBuf[backIdx] = g_displayBuf[g_frontIdx.load(std::memory_order_acquire)];
+            g_displayBuf[backIdx].agent.status = parseStatus(data["status"] | "offline");
+            g_displayBuf[backIdx].agent.processName = data["process"] | "";
+            g_displayBuf[backIdx].agent.cpuPercent = data["cpu"] | 0.0;
+            g_displayBuf[backIdx].agent.memoryMB = data["memory"] | 0.0;
+            g_displayBuf[backIdx].agent.uptimeSeconds = data["uptime"] | 0;
+            g_frontIdx.store(backIdx, std::memory_order_release);
         }
         
         // 首次成功解析status包 → 新固件健康，取消OTA回滚
@@ -484,13 +508,16 @@ void parseServerData(String json) {
         if (error) { Serial.printf("[JSON] token parse error: %s\n", error.c_str()); return; }
         
         JsonObject data = doc["data"];
-        if (xSemaphoreTake(g_dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            g_displayData.tokens.inputTokens = data["input"] | 0;
-            g_displayData.tokens.outputTokens = data["output"] | 0;
-            g_displayData.tokens.totalRequests = data["requests"] | 0;
-            g_displayData.tokens.hourTokens = data["hour"] | 0;
-            g_displayData.tokens.costUSD = data["cost"] | 0.0;
-            xSemaphoreGive(g_dataMutex);
+        // [Step 5] 双缓冲写入
+        {
+            int backIdx = 1 - g_frontIdx.load(std::memory_order_acquire);
+            g_displayBuf[backIdx] = g_displayBuf[g_frontIdx.load(std::memory_order_acquire)];
+            g_displayBuf[backIdx].tokens.inputTokens = data["input"] | 0;
+            g_displayBuf[backIdx].tokens.outputTokens = data["output"] | 0;
+            g_displayBuf[backIdx].tokens.totalRequests = data["requests"] | 0;
+            g_displayBuf[backIdx].tokens.hourTokens = data["hour"] | 0;
+            g_displayBuf[backIdx].tokens.costUSD = data["cost"] | 0.0;
+            g_frontIdx.store(backIdx, std::memory_order_release);
         }
     }
     else if (type == "weather") {
@@ -509,15 +536,18 @@ void parseServerData(String json) {
         if (error) { Serial.printf("[JSON] weather parse error: %s\n", error.c_str()); return; }
         
         JsonObject data = doc["data"];
-        if (xSemaphoreTake(g_dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            g_displayData.weather.city = data["city"] | "";
-            g_displayData.weather.temperature = data["temp"] | 0.0;
-            g_displayData.weather.feelsLike = data["feels_like"] | 0.0;
-            g_displayData.weather.humidity = data["humidity"] | 0;
-            g_displayData.weather.description = data["desc"] | "";
-            g_displayData.weather.iconCode = data["icon"] | "";
-            g_displayData.weather.windSpeed = data["wind"] | 0.0;
-            xSemaphoreGive(g_dataMutex);
+        // [Step 5] 双缓冲写入
+        {
+            int backIdx = 1 - g_frontIdx.load(std::memory_order_acquire);
+            g_displayBuf[backIdx] = g_displayBuf[g_frontIdx.load(std::memory_order_acquire)];
+            g_displayBuf[backIdx].weather.city = data["city"] | "";
+            g_displayBuf[backIdx].weather.temperature = data["temp"] | 0.0;
+            g_displayBuf[backIdx].weather.feelsLike = data["feels_like"] | 0.0;
+            g_displayBuf[backIdx].weather.humidity = data["humidity"] | 0;
+            g_displayBuf[backIdx].weather.description = data["desc"] | "";
+            g_displayBuf[backIdx].weather.iconCode = data["icon"] | "";
+            g_displayBuf[backIdx].weather.windSpeed = data["wind"] | 0.0;
+            g_frontIdx.store(backIdx, std::memory_order_release);
         }
     }
     else if (type == "pixel_data") {

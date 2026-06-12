@@ -17,6 +17,13 @@
 #define SERVER_PORT 19876
 #define RECONNECT_INTERVAL 5000
 
+// TCP连接配置
+#define CLIENT_TCP_TIMEOUT      10     // 秒，WiFiClient::setTimeout
+#define CLIENT_TCP_KEEPIDLE     5      // 秒，空闲后发第一个keepalive探测
+#define CLIENT_TCP_KEEPINTVL    5      // 秒，探测间隔
+#define CLIENT_TCP_KEEPCNT      3      // 探测失败次数后断开
+#define CLIENT_READ_BUF_SIZE    512    // TCP批量读取缓冲区大小
+
 // 屏幕引脚定义 (微雪ESP32-S3 1.54inch LCD)
 #define LCD_CS    5
 #define LCD_RST   4

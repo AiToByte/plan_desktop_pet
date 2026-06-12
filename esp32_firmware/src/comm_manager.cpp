@@ -38,10 +38,19 @@ bool CommManager::connect() {
     Serial.print(":");
     Serial.println(_serverPort);
     
+    // [Step 3] TCP超时配置（必须在connect前设置）
+    _client.setTimeout(CLIENT_TCP_TIMEOUT);
+    
     if (_client.connect(_serverHost.c_str(), _serverPort)) {
         Serial.println("[Comm] Connected!");
         _connected = true;
         _frameState = FRAME_IDLE;
+        
+        // [Step 3] TCP Keep-Alive（空闲检测连接死活）
+        _client.setOption(TCP_KEEPALIVE, true);
+        _client.setOption(TCP_KEEPIDLE,  CLIENT_TCP_KEEPIDLE);
+        _client.setOption(TCP_KEEPINTVL, CLIENT_TCP_KEEPINTVL);
+        _client.setOption(TCP_KEEPCNT,   CLIENT_TCP_KEEPCNT);
         _reconnectFailCount = 0;           // 重置退避计数
         _reconnectInterval = RECONNECT_INTERVAL;  // 重置退避间隔
         
@@ -79,6 +88,9 @@ void CommManager::reconnect() {
     _lastReconnect = now;
     _reconnectFailCount++;
     
+    // [Step 1] 先断开旧连接，防止socket泄漏
+    disconnect();
+    
     // 连续失败10次 → WiFi硬重置（解决DHCP/关联状态异常）
     if (_reconnectFailCount >= 10) {
         Serial.println("[Comm] 10 failures, hard-resetting WiFi...");
@@ -102,8 +114,12 @@ void CommManager::reconnect() {
 void CommManager::update() {
     if (!_connected) return;
     
-    while (_client.available()) {
-        char c = _client.read();
+    // [Step 2] 批量TCP读取：readBytes替代逐char read()，减少WiFi驱动开销
+    // 支持跨多个update()调用累积完整帧，修复大消息截断问题
+    while (_client.connected() && _client.available()) {
+        size_t bytesRead = _client.readBytes(_readBuf, CLIENT_READ_BUF_SIZE);
+        for (size_t i = 0; i < bytesRead; i++) {
+            char c = _readBuf[i];
         
         switch (_frameState) {
             case FRAME_IDLE:

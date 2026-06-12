@@ -80,15 +80,26 @@ bool PixelPlayer::loadFromBuffer(const uint8_t* data, size_t len) {
         _header.frame_interval = 200;
     }
 
-    // 计算总帧缓冲大小
-    size_t totalSize = (size_t)_header.frame_count * _header.width * _header.height * 2;
-
-    // 在PSRAM中分配缓冲区
-    _frameBuffer = (uint16_t*)ps_malloc(totalSize);
-    if (!_frameBuffer) {
-        Serial.printf("[PixelPlayer] Failed to allocate %u bytes in PSRAM\n", totalSize);
-        return false;
+    // [Step 4] 计算总帧缓冲大小（使用size_t防止uint16_t溢出）
+    size_t totalSize = (size_t)_header.frame_count * (size_t)_header.width * (size_t)_header.height * 2;
+    
+    // [Step 4] PSRAM预分配池：复用静态缓冲区，避免反复ps_malloc/free导致堆碎片
+    static uint16_t* s_psramPool = nullptr;
+    static size_t    s_poolSize  = 0;
+    
+    if (s_poolSize < totalSize) {
+        // 需要更大的缓冲区，释放旧的重新分配
+        if (s_psramPool) { free(s_psramPool); s_psramPool = nullptr; }
+        s_psramPool = (uint16_t*)ps_malloc(totalSize);
+        if (!s_psramPool) {
+            Serial.printf("[PixelPlayer] Failed to allocate %u bytes in PSRAM pool\n", totalSize);
+            s_poolSize = 0;
+            return false;
+        }
+        s_poolSize = totalSize;
+        Serial.printf("[PixelPlayer] PSRAM pool allocated: %u bytes\n", totalSize);
     }
+    _frameBuffer = s_psramPool;
 
     // 拷贝像素数据到PSRAM
     if (_header.flags & PXL_FLAG_RLE) {

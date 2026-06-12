@@ -41,6 +41,9 @@ private:
     String _serverHost;
     int _serverPort;
     
+    // [Step 2] 批量读取缓冲区
+    char _readBuf[CLIENT_READ_BUF_SIZE];
+    
     // 帧协议状态机
     FrameState _frameState;
     String _lenBuffer;       // 累积 LEN: 前缀
