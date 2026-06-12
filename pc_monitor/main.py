@@ -17,6 +17,7 @@ from modules.agent_monitor import AgentMonitor, AgentStatus
 from modules.token_stats import TokenTracker
 from modules.weather import WeatherService
 from modules.communication import create_communication, DeviceMessage
+from modules.otlp_receiver import OTLPReceiver
 
 # 配置日志
 logging.basicConfig(
@@ -42,6 +43,11 @@ class DesktopPetMonitor:
         self.token_tracker = TokenTracker(self.config.get("token_stats", {}))
         self.weather_service = WeatherService(self.config.get("weather", {}))
         self.communication = create_communication(self.config.get("communication", {}))
+        
+        # OTLP接收器
+        otlp_port = self.config.get("otlp", {}).get("port", 4318)
+        self._otlp_receiver = OTLPReceiver(port=otlp_port)
+        self._otlp_receiver.set_span_callback(self._on_otlp_span)
         
         # 状态
         self.last_status = None
@@ -76,6 +82,9 @@ class DesktopPetMonitor:
     def _send_status_update(self):
         """发送Agent状态更新"""
         state = self.agent_monitor.get_state()
+        
+        # 同步Agent状态给天气服务，激活自适应刷新率
+        self.weather_service.set_agent_status(state.status.value)
         
         msg = DeviceMessage(
             msg_type="status",
@@ -180,6 +189,10 @@ class DesktopPetMonitor:
         
         self.running = True
         
+        # 启动OTLP接收器
+        self._otlp_receiver.start()
+        logger.info(f"OTLP接收器已启动，端口: {self.config.get('otlp', {}).get('port', 4318)}")
+        
         # 启动定时更新线程
         import threading
         update_thread = threading.Thread(target=self._periodic_update, daemon=True)
@@ -202,8 +215,55 @@ class DesktopPetMonitor:
         """停止监控程序"""
         logger.info("正在停止监控程序...")
         self.running = False
+        self._otlp_receiver.stop()
         self.communication.disconnect()
         logger.info("监控程序已停止")
+    
+    def _on_otlp_span(self, span):
+        """处理OTLP接收的span，转发给ESP32显示"""
+        status_mapping = {
+            "agent.idle": "idle",
+            "agent.thinking": "busy",
+            "agent.generating": "busy",
+            "agent.tool_call": "busy",
+            "agent.waiting": "idle",
+            "agent.error": "offline",
+            "agent.complete": "idle",
+        }
+        detail_mapping = {
+            "agent.idle": "空闲",
+            "agent.thinking": "思考中...",
+            "agent.generating": "生成中...",
+            "agent.tool_call": f"调用 {span.attributes.get('tool.name', '工具')}...",
+            "agent.waiting": "等待输入",
+            "agent.error": f"错误: {span.status_message or '未知'}",
+            "agent.complete": "完成",
+        }
+        
+        if span.span_name not in status_mapping:
+            return
+        
+        device_status = status_mapping[span.span_name]
+        detail = detail_mapping.get(span.span_name, "")
+        
+        # 工具调用时优先用custom_detail
+        if span.span_name == "agent.tool_call" and span.custom_detail:
+            detail = span.custom_detail
+        
+        msg = DeviceMessage(
+            msg_type="status",
+            data={
+                "agent_status": device_status,
+                "agent_name": span.attributes.get("agent.name", "AI Agent"),
+                "task_desc": detail,
+                "timestamp": span.start_time / 1e9 if span.start_time else time.time()
+            },
+            timestamp=time.time()
+        )
+        
+        if self.communication.is_connected():
+            self.communication.send_message(msg)
+            logger.debug(f"OTLP转发: {span.span_name} → {device_status}")
 
 
 def main():

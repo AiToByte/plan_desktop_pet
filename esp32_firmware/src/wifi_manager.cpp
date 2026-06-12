@@ -41,12 +41,12 @@ bool WiFiManager::tryUDPDiscovery(unsigned long timeoutMs) {
                     if (ip.length() > 0 && port > 0) {
                         Serial.printf("[WiFi] UDP Discovery: 发现服务器 %s:%d\n", ip.c_str(), port);
                         
-                        // 保存到WebConfig (通过Preferences直接写)
+                        // 保存到Flash（与WebConfig统一命名空间和Key）
                         Preferences prefs;
-                        prefs.begin("webconfig", false);
-                        prefs.putString("server_host", ip);
-                        prefs.putInt("server_port", port);
-                        prefs.putBool("has_config", true);
+                        prefs.begin("pet_config", false);
+                        prefs.putString("host", ip);
+                        prefs.putInt("port", port);
+                        prefs.putBool("valid", true);
                         prefs.end();
                         
                         udp.stop();

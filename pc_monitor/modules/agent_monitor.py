@@ -113,8 +113,14 @@ class AgentMonitor:
             jsonl_files.sort(key=os.path.getmtime, reverse=True)
             latest = jsonl_files[0]
             try:
-                with open(latest, 'r', encoding='utf-8', errors='ignore') as f:
-                    lines = f.readlines()
+                # 优化：只读取文件末尾8KB，避免大文件全量读入
+                with open(latest, 'rb') as f:
+                    try:
+                        f.seek(-8192, os.SEEK_END)
+                    except OSError:
+                        f.seek(0)  # 文件小于8KB则从头读取
+                    content = f.read().decode('utf-8', errors='ignore')
+                    lines = content.splitlines()
                 # 只检查最后N行
                 for line in lines[-self._auth_jsonl_max_lines:]:
                     try:

@@ -6,6 +6,7 @@
  */
 
 #include <Arduino.h>
+#include <atomic>
 #include "config.h"
 #include "types.h"
 #include "display_manager.h"
@@ -37,12 +38,14 @@ unsigned long g_lastDataReceived = 0;  // 最后收到有效数据的时间
 bool g_screenDimmed = false;
 bool g_screenSleeping = false;
 bool g_forceWake = false;  // 通信收到数据时强制唤醒
+bool g_isOffline = false;  // 45秒无数据→离线状态
 
 // Core 0 → Core 1 显示操作待处理标志（避免跨核直接调LCD/SPI）
-volatile bool g_pendingNormalMode = false;
-volatile bool g_pendingPixelPlay = false;
-volatile bool g_pendingPixelStop = false;
-PixelPlayer* g_pendingPixelPtr = nullptr;
+// 使用std::atomic确保双核SMP架构下的内存强一致性
+std::atomic<bool> g_pendingNormalMode{false};
+std::atomic<bool> g_pendingPixelPlay{false};
+std::atomic<bool> g_pendingPixelStop{false};
+std::atomic<PixelPlayer*> g_pendingPixelPtr{nullptr};
 
 // ============ 前向声明 ============
 void parseServerData(String json);
@@ -78,8 +81,39 @@ void commTask(void* pvParameters) {
                 g_displayData.connected = true;
                 g_displayData.lastUpdate = now;
                 g_lastDataReceived = now;
+                g_isOffline = false;
                 g_forceWake = true;  // 通知渲染任务唤醒屏幕
                 xSemaphoreGive(g_dataMutex);
+            }
+        }
+
+        // 离线检测：45秒无数据 → OFFLINE
+        if (!g_isOffline && (now - g_lastDataReceived > OFFLINE_TIMEOUT_MS)) {
+            if (xSemaphoreTake(g_dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                g_displayData.connected = false;
+                g_displayData.agent.status = STATUS_OFFLINE;
+                g_isOffline = true;
+                xSemaphoreGive(g_dataMutex);
+            }
+            Serial.println("[CommTask] 45s无数据，进入OFFLINE模式");
+        }
+
+        // BOOT键(GPIO0)：短按停止像素播放，切回普通模式；休眠中按下则唤醒屏幕
+        if (digitalRead(0) == LOW) {
+            delay(50);  // 消抖
+            if (digitalRead(0) == LOW) {
+                // 休眠状态下：唤醒屏幕显示15秒
+                if (g_screenSleeping) {
+                    g_forceWake = true;
+                    Serial.println("[CommTask] BOOT键：唤醒屏幕(15s)");
+                }
+                // 普通状态下：停止像素播放
+                else if (pixelPlayer.isLoaded()) {
+                    pixelPlayer.stop();
+                    g_pendingNormalMode.store(true);
+                    Serial.println("[CommTask] BOOT键：停止像素播放");
+                }
+                while (digitalRead(0) == LOW) vTaskDelay(pdMS_TO_TICKS(10));  // 等释放
             }
         }
         
@@ -183,13 +217,22 @@ void renderTask(void* pvParameters) {
         // ===== 显示更新 =====
         if (now - lastDisplayUpdate >= UPDATE_INTERVAL) {
             lastDisplayUpdate = now;
-            display.update(localData);
+            if (g_isOffline && !pixelPlayer.isLoaded()) {
+                // 离线模式：显示时钟+眨眼动画
+                display.drawClock();
+            } else {
+                display.update(localData);
+            }
         }
         
         // ===== 动画更新 =====
         if (now - lastAnimationUpdate >= ANIMATION_INTERVAL) {
             lastAnimationUpdate = now;
-            display.updateAnimation();
+            if (g_isOffline && !pixelPlayer.isLoaded()) {
+                display.drawBlinkAnim();
+            } else {
+                display.updateAnimation();
+            }
         }
         
         vTaskDelay(pdMS_TO_TICKS(20));  // ~50fps上限
@@ -226,6 +269,10 @@ void setup() {
     if (wifi.connect()) {
         Serial.println("[WiFi] Connected: " + wifi.getIP());
         display.showBootScreen("WiFi: " + wifi.getIP());
+        
+        // 同步NTP时间（东八区）
+        configTime(8 * 3600, 0, "ntp.aliyun.com", "ntp1.aliyun.com");
+        Serial.println("[INIT] NTP sync started");
         
         // 设置通信服务器地址
         String serverHost = wifi.getServerHost();

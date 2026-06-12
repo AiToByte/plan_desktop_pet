@@ -273,6 +273,7 @@ class TokenTracker:
             "total_tokens": total_input + total_output,
             "requests": total_requests
         })
+        self._stats_history = self._stats_history[-1000:]  # 限制内存列表大小，防止长期运行内存泄漏
         self._save_cache()
         
         self._cached_stats = stats
