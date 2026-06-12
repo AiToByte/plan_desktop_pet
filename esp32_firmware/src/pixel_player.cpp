@@ -91,7 +91,41 @@ bool PixelPlayer::loadFromBuffer(const uint8_t* data, size_t len) {
     }
 
     // 拷贝像素数据到PSRAM
-    memcpy(_frameBuffer, data + PXL_HEADER_SIZE, totalSize);
+    if (_header.flags & PXL_FLAG_RLE) {
+        // RLE压缩数据：需逐帧解压
+        size_t pixelsPerFrame = (size_t)_header.width * _header.height;
+        const uint8_t* src = data + PXL_FILE_HEADER_SIZE;
+        size_t remaining = len - PXL_FILE_HEADER_SIZE;
+
+        for (uint16_t f = 0; f < _header.frame_count; f++) {
+            uint16_t* dst = _frameBuffer + f * pixelsPerFrame;
+            if (!rleDecompress(src, remaining, dst, pixelsPerFrame)) {
+                Serial.printf("[PixelPlayer] RLE decompress failed at frame %d\n", f);
+                free(_frameBuffer);
+                _frameBuffer = nullptr;
+                return false;
+            }
+            // 前进src：需要扫描压缩数据实际消耗的字节数
+            size_t consumed = 0;
+            size_t decoded = 0;
+            while (decoded < pixelsPerFrame && consumed < remaining) {
+                uint8_t flag = src[consumed++];
+                if (flag & 0x80) {
+                    decoded += flag & 0x7F;
+                    consumed += 2;  // 2字节重复像素
+                } else {
+                    decoded += flag;
+                    consumed += flag * 2;
+                }
+            }
+            src += consumed;
+            remaining -= consumed;
+        }
+        Serial.printf("[PixelPlayer] RLE decompressed %d frames OK\n", _header.frame_count);
+    } else {
+        // 原始未压缩数据：直接拷贝
+        memcpy(_frameBuffer, data + PXL_FILE_HEADER_SIZE, totalSize);
+    }
 
     _currentFrame = 0;
     _state = PXL_STOPPED;
@@ -183,4 +217,35 @@ void PixelPlayer::release() {
     _state = PXL_IDLE;
     _currentFrame = 0;
     memset(&_header, 0, sizeof(PxlFileHeader));
+}
+
+// ============ RLE 解压 ============
+// 格式: flag_byte >= 0x80 → run长度=(flag & 0x7F), 后2字节像素(big-endian)
+//        flag_byte <  0x80 → literal长度=flag, 后 flag*2 字节原始像素
+bool PixelPlayer::rleDecompress(const uint8_t* compressed, size_t compLen, uint16_t* output, size_t pixelCount) {
+    size_t ci = 0;   // compressed index
+    size_t oi = 0;   // output index
+
+    while (oi < pixelCount && ci < compLen) {
+        uint8_t flag = compressed[ci++];
+        if (flag & 0x80) {
+            // Run-length: 重复同一个像素
+            uint8_t count = flag & 0x7F;
+            if (ci + 2 > compLen) return false;
+            uint16_t pixel = ((uint16_t)compressed[ci] << 8) | compressed[ci + 1]; // big-endian
+            ci += 2;
+            for (uint8_t i = 0; i < count && oi < pixelCount; i++) {
+                output[oi++] = pixel;
+            }
+        } else {
+            // Literal: 直接拷贝原始像素
+            uint8_t count = flag;
+            if (ci + count * 2 > compLen) return false;
+            for (uint8_t i = 0; i < count && oi < pixelCount; i++) {
+                output[oi++] = ((uint16_t)compressed[ci] << 8) | compressed[ci + 1];
+                ci += 2;
+            }
+        }
+    }
+    return (oi == pixelCount);
 }

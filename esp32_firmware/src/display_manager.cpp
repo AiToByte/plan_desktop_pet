@@ -5,6 +5,7 @@
 
 #include "display_manager.h"
 #include <math.h>
+#include <time.h>
 
 // ============ 构造 / 初始化 ============
 
@@ -800,4 +801,76 @@ void DisplayManager::wakeup() {
     // 恢复全亮
     _lcd.setBrightness(200);
     Serial.println("[Display] Woke up, full brightness");
+}
+
+// ============ 离线模式时钟 ============
+
+void DisplayManager::drawClock() {
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    localtime_r(&timeinfo, &now);
+
+    char timeStr[6];
+    snprintf(timeStr, sizeof(timeStr), "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+
+    _sprite.fillScreen(COLOR_BG);
+
+    // 大号居中时钟
+    _sprite.setTextSize(4);
+    _sprite.setTextColor(COLOR_TEXT, COLOR_BG);
+    int textW = strlen(timeStr) * 6 * 4;  // 6px/char * textSize4
+    int tx = (SCREEN_WIDTH - textW) / 2;
+    int ty = SCREEN_HEIGHT / 2 - 16;
+    _sprite.setCursor(tx, ty);
+    _sprite.print(timeStr);
+
+    // 底部小字 "OFFLINE"
+    _sprite.setTextSize(1);
+    _sprite.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+    const char* label = "OFFLINE";
+    int lw = strlen(label) * 6;
+    _sprite.setCursor((SCREEN_WIDTH - lw) / 2, SCREEN_HEIGHT - 20);
+    _sprite.print(label);
+
+    // 离线状态指示灯（灰色）
+    _sprite.fillCircle(SCREEN_WIDTH - 15, 15, 5, COLOR_OFFLINE);
+
+    _sprite.pushSprite(&_lcd, 0, 0);
+}
+
+// ============ 眨眼动画 ============
+
+void DisplayManager::drawBlinkAnim() {
+    // 静态帧计数，每次调用递增
+    static uint8_t blinkFrame = 0;
+    static unsigned long lastBlink = 0;
+    unsigned long now = millis();
+
+    // 每3秒眨一次眼
+    bool isBlinking = false;
+    if (now - lastBlink > 3000) {
+        isBlinking = (blinkFrame < 3);  // 连续3帧闭眼
+        blinkFrame++;
+        if (blinkFrame >= 6) {
+            blinkFrame = 0;
+            lastBlink = now;
+        }
+    }
+
+    int cx = SCREEN_WIDTH / 2;
+    int cy = SCREEN_HEIGHT / 2;
+
+    if (isBlinking) {
+        // 闭眼：画两条横线
+        _sprite.fillRect(cx - 20, cy - 2, 12, 3, FACE_BLACK);
+        _sprite.fillRect(cx + 8, cy - 2, 12, 3, FACE_BLACK);
+    } else {
+        // 睁眼：画两个圆点
+        _sprite.fillCircle(cx - 14, cy, 4, FACE_BLACK);
+        _sprite.fillCircle(cx + 14, cy, 4, FACE_BLACK);
+    }
+
+    // 嘴巴
+    _sprite.fillCircle(cx, cy + 16, 3, FACE_BLACK);
 }

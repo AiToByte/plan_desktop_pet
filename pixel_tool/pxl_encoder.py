@@ -8,6 +8,7 @@ from PIL import Image
 
 PXL_MAGIC = b'PXL'
 PXL_VERSION = 1
+PXL_FLAG_RLE = 0x0002  # flags bit1: RLE压缩
 DEFAULT_SIZE = (32, 32)
 DEFAULT_INTERVAL = 200  # ms
 
@@ -30,6 +31,52 @@ def image_to_rgb565_data(img: Image.Image) -> bytes:
             offset = (y * w + x) * 2
             struct.pack_into('<H', data, offset, pixel)
     return bytes(data)
+
+
+def rle_compress(rgb565_data: bytes) -> bytes:
+    """RLE压缩RGB565数据流
+    格式: [flag_byte][data]
+    - bit7=1: run长度=(flag & 0x7F), 后接2字节重复像素(big-endian)
+    - bit7=0: literal长度=flag, 后接 flag*2 字节原始像素
+    """
+    result = bytearray()
+    pos = 0
+    total = len(rgb565_data) // 2  # 总像素数
+
+    while pos < total:
+        # 检查是否有连续重复像素(至少2个)
+        run_len = 1
+        if pos + 1 < total:
+            pixel0 = struct.unpack_from('<H', rgb565_data, pos * 2)[0]
+            while pos + run_len < total and run_len < 127:
+                pixel_n = struct.unpack_from('<H', rgb565_data, (pos + run_len) * 2)[0]
+                if pixel_n != pixel0:
+                    break
+                run_len += 1
+
+        if run_len >= 3:
+            # 写入run: flag=0x80|count, pixel(big-endian)
+            result.append(0x80 | run_len)
+            result.extend(struct.pack('>H', pixel0))
+            pos += run_len
+        else:
+            # 收集literal序列
+            lit_start = pos
+            while pos < total and (pos - lit_start) < 127:
+                # 检查是否接下来出现3+连续重复
+                if pos + 2 < total:
+                    p = struct.unpack_from('<H', rgb565_data, pos * 2)[0]
+                    if (struct.unpack_from('<H', rgb565_data, (pos+1) * 2)[0] == p and
+                        struct.unpack_from('<H', rgb565_data, (pos+2) * 2)[0] == p):
+                        break
+                pos += 1
+            lit_count = pos - lit_start
+            if lit_count > 0:
+                result.append(lit_count)
+                for i in range(lit_count):
+                    result.extend(struct.pack('<H', struct.unpack_from('<H', rgb565_data, (lit_start + i) * 2)[0]))
+
+    return bytes(result)
 
 
 def create_pxl_header(width: int, height: int, frame_count: int,

@@ -4,6 +4,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <Update.h>
 #include "config.h"
 
 // 配网状态
@@ -66,6 +67,10 @@ private:
     void handleSave();
     void handleReset();
     void handleStatus();
+    
+    // OTA固件升级
+    void handleOTA();
+    void handleOTAUpload();
     
     // 生成配网页面HTML
     String getConfigPageHTML();

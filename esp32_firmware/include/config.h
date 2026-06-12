@@ -45,6 +45,9 @@
 #define SCREEN_DIM_TIMEOUT   30000  // 30秒无数据→变暗
 #define SCREEN_SLEEP_TIMEOUT 60000  // 60秒无数据→休眠(关背光)
 
+// 离线检测配置
+#define OFFLINE_TIMEOUT_MS   45000  // 45秒无数据→状态切为OFFLINE
+
 // 状态定义
 #define STATUS_IDLE      0
 #define STATUS_WORKING   1

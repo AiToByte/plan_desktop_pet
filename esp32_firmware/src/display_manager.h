@@ -131,6 +131,8 @@ private:
     void drawWeatherPanel(const WeatherInfo& weather);
     void drawTokenPanel(const TokenStats& tokens);
     void drawFaceAnimation();
+    void drawClock();        // 离线模式：显示实时时钟
+    void drawBlinkAnim();    // 眨眼动画
 
     // 像素帧绘制
     void drawPixelFrame();

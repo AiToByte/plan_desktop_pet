@@ -15,6 +15,7 @@
 #define PXL_DEFAULT_H     32
 #define PXL_MAX_FRAMES    64
 #define PXL_FLAG_LOOP     0x0001
+#define PXL_FLAG_RLE      0x0002
 
 // PXL文件头结构 (16字节, packed)
 #pragma pack(push, 1)
@@ -88,6 +89,7 @@ private:
     // 辅助方法
     bool validateHeader(const uint8_t* data, size_t len) const;
     size_t getFrameSize() const { return _header.width * _header.height * 2; }
+    bool rleDecompress(const uint8_t* compressed, size_t compLen, uint16_t* output, size_t pixelCount);
 };
 
 #endif // PIXEL_PLAYER_H

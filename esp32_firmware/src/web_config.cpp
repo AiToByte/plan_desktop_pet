@@ -68,6 +68,10 @@ void WebConfig::startAPMode() {
     _server->on("/reset", HTTP_GET, [this]() { handleReset(); });
     _server->on("/status", HTTP_GET, [this]() { handleStatus(); });
     
+    // OTA固件升级路由
+    _server->on("/ota", HTTP_GET, [this]() { handleOTA(); });
+    _server->on("/update", HTTP_POST, [this]() { handleOTAUpload(); }, [this]() { /* multipart handler handled internally */ });
+    
     _server->begin();
     _state = CONFIG_AP_MODE;
     _configStartTime = millis();
@@ -341,6 +345,7 @@ String WebConfig::getConfigPageHTML() {
             </div>
             <button type="submit">✅ 保存并连接</button>
         </form>
+        <a href="/ota"><button style="background:linear-gradient(135deg,#00b894 0%,#00cec9 100%);margin-bottom:10px;" type="button">📦 固件升级(OTA)</button></a>
         <div class="divider"></div>
         <a href="/reset"><button class="reset-btn" type="button">🔄 重置配置</button></a>
         <div class="footer">配置将保存到设备，重启后自动连接</div>
@@ -434,4 +439,147 @@ String WebConfig::getErrorPageHTML(String msg) {
 </html>
 )rawliteral";
     return html;
+}
+
+// ============ OTA 固件升级 ============
+
+void WebConfig::handleOTA() {
+    String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>固件升级 - 桌面宠物</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+               background: linear-gradient(135deg, #0c0c1d 0%, #1a1a2e 50%, #16213e 100%);
+               min-height: 100vh; display: flex; justify-content: center; align-items: center; }
+        .container { background: rgba(255,255,255,0.95); border-radius: 24px;
+                     padding: 40px; width: 100%; max-width: 420px;
+                     box-shadow: 0 20px 60px rgba(0,0,0,0.3); text-align: center; }
+        .emoji { font-size: 64px; margin-bottom: 20px; }
+        h1 { color: #2d3436; margin-bottom: 10px; font-size: 24px; }
+        p { color: #666; margin-bottom: 20px; font-size: 14px; }
+        .upload-area { border: 2px dashed #ddd; border-radius: 12px; padding: 30px;
+                       margin-bottom: 20px; cursor: pointer; transition: all 0.3s; }
+        .upload-area:hover { border-color: #667eea; background: rgba(102,126,234,0.05); }
+        .upload-area.dragover { border-color: #667eea; background: rgba(102,126,234,0.1); }
+        input[type="file"] { display: none; }
+        .btn { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+               color: white; border: none; padding: 14px 40px; border-radius: 12px;
+               font-size: 16px; font-weight: 600; cursor: pointer; width: 100%; margin-bottom: 10px; }
+        .btn:hover { transform: translateY(-2px); box-shadow: 0 10px 30px rgba(102,126,234,0.4); }
+        .btn:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
+        .btn-back { background: transparent; color: #667eea; box-shadow: none; margin-top: 10px; }
+        .progress { display: none; margin-bottom: 20px; }
+        .progress-bar { height: 8px; background: #eee; border-radius: 4px; overflow: hidden; }
+        .progress-fill { height: 100%; background: linear-gradient(90deg, #667eea, #764ba2);
+                         width: 0%; transition: width 0.3s; }
+        .progress-text { font-size: 12px; color: #999; margin-top: 5px; }
+        .status { margin-top: 15px; padding: 12px; border-radius: 8px; font-size: 14px; display: none; }
+        .status.success { background: #d4edda; color: #155724; display: block; }
+        .status.error { background: #f8d7da; color: #721c24; display: block; }
+        .file-info { margin-top: 10px; font-size: 13px; color: #667eea; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="emoji">📦</div>
+        <h1>固件升级</h1>
+        <p>选择 .bin 固件文件进行OTA无线升级</p>
+        <form id="otaForm" method="POST" action="/update" enctype="multipart/form-data">
+            <div class="upload-area" id="uploadArea">
+                <p>📁 点击选择或拖拽固件文件</p>
+                <p style="font-size:12px;color:#999;">支持 .bin 格式</p>
+                <input type="file" id="firmware" name="firmware" accept=".bin">
+            </div>
+            <div class="file-info" id="fileInfo"></div>
+            <div class="progress" id="progress">
+                <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+                <div class="progress-text" id="progressText">0%</div>
+            </div>
+            <button type="submit" class="btn" id="uploadBtn" disabled>🚀 开始升级</button>
+            <a href="/" class="btn btn-back">← 返回配置页</a>
+        </form>
+        <div class="status" id="status"></div>
+    </div>
+    <script>
+        const uploadArea = document.getElementById('uploadArea');
+        const fileInput = document.getElementById('firmware');
+        const fileInfo = document.getElementById('fileInfo');
+        const uploadBtn = document.getElementById('uploadBtn');
+        const progress = document.getElementById('progress');
+        const progressFill = document.getElementById('progressFill');
+        const progressText = document.getElementById('progressText');
+        const status = document.getElementById('status');
+        uploadArea.addEventListener('click', () => fileInput.click());
+        uploadArea.addEventListener('dragover', (e) => { e.preventDefault(); uploadArea.classList.add('dragover'); });
+        uploadArea.addEventListener('dragleave', () => uploadArea.classList.remove('dragover'));
+        uploadArea.addEventListener('drop', (e) => { e.preventDefault(); uploadArea.classList.remove('dragover');
+            if (e.dataTransfer.files.length) { fileInput.files = e.dataTransfer.files; handleFile(e.dataTransfer.files[0]); } });
+        fileInput.addEventListener('change', () => { if (fileInput.files.length) handleFile(fileInput.files[0]); });
+        function handleFile(file) {
+            if (!file.name.endsWith('.bin')) { status.className = 'status error'; status.textContent = '请选择 .bin 文件'; status.style.display='block'; return; }
+            fileInfo.textContent = file.name + ' (' + (file.size/1024).toFixed(1) + ' KB)';
+            uploadBtn.disabled = false; status.style.display = 'none';
+        }
+        document.getElementById('otaForm').addEventListener('submit', function(e) {
+            e.preventDefault();
+            const formData = new FormData(this);
+            const xhr = new XMLHttpRequest();
+            xhr.upload.addEventListener('progress', (e) => {
+                if (e.lengthComputable) { const pct = Math.round(e.loaded/e.total*100);
+                    progressFill.style.width = pct + '%'; progressText.textContent = pct + '%'; }
+            });
+            xhr.onload = function() {
+                if (xhr.status === 200) { status.className = 'status success';
+                    status.textContent = '✅ 固件升级成功！设备即将重启...'; }
+                else { status.className = 'status error'; status.textContent = '❌ 升级失败: ' + xhr.responseText; }
+                uploadBtn.disabled = false;
+            };
+            xhr.onerror = function() { status.className = 'status error'; status.textContent = '❌ 网络错误'; uploadBtn.disabled = false; };
+            progress.style.display = 'block'; uploadBtn.disabled = true;
+            xhr.open('POST', '/update'); xhr.send(formData);
+        });
+    </script>
+</body>
+</html>
+)rawliteral";
+    _server->send(200, "text/html", html);
+}
+
+void WebConfig::handleOTAUpload() {
+    HTTPUpload& upload = _server->upload();
+
+    if (upload.status == UPLOAD_FILE_START) {
+        Serial.printf("[OTA] Start: %s\n", upload.filename.c_str());
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+            Update.printError(Serial);
+        }
+    }
+    else if (upload.status == UPLOAD_FILE_WRITE) {
+        if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+            Update.printError(Serial);
+        }
+    }
+    else if (upload.status == UPLOAD_FILE_END) {
+        if (Update.end(true)) {
+            Serial.printf("[OTA] Success: %u bytes\n", upload.totalSize);
+        } else {
+            Update.printError(Serial);
+        }
+    }
+
+    // 上传完成后发送响应
+    if (upload.status == UPLOAD_FILE_END) {
+        if (Update.hasError()) {
+            _server->send(500, "text/plain", "升级失败");
+        } else {
+            _server->send(200, "text/plain", "升级成功");
+            delay(1000);
+            ESP.restart();
+        }
+    }
 }
