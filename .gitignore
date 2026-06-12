@@ -9,16 +9,17 @@ build/
 .eggs/
 venv/
 .venv/
+.pyvenv/
 env/
 .env
+.env.*
+__pypackages__/
 
 # === PlatformIO ===
 .pio/
 .pioenvs/
 .piolibdeps/
-.pio/
-lib/
-test/
+# 不忽略 esp32_firmware/lib/（项目库文件需跟踪）
 
 # === Logs ===
 *.log
@@ -40,14 +41,19 @@ Thumbs.db
 desktop.ini
 ehthumbs.db
 
+# === Claude Code ===
+.claude/
+
 # === Project specific ===
-# Config with local paths (use config.example.json as template)
+# 本地规划文档（非项目交付物）
+plan_optimization/
+
+# 工具生成的代码打包文件
+repomix-output.xml
+
+# 本地配置（含路径/密钥，使用 config.example.json 作为模板）
 pc_monitor/config/config.json
 pc_monitor/config/*.json
-
-# Pixel tool cache
-pixel_tool/__pycache__/
-pixel_tool/*.pyc
 
 # Build outputs
 *.bin
