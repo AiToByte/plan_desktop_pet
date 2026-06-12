@@ -16,6 +16,7 @@
 #include "comm_manager.h"
 #include "sound_manager.h"
 #include "touch_handler.h"
+#include <esp_ota_ops.h>
 
 // ============ 共享数据 (mutex保护) ============
 DisplayData g_displayData;
@@ -43,8 +44,6 @@ unsigned long g_lastDataReceived = 0;  // 最后收到有效数据的时间
 bool g_screenDimmed = false;
 bool g_screenSleeping = false;
 bool g_forceWake = false;  // 通信收到数据时强制唤醒
-bool g_isOffline = false;  // 45秒无数据→离线状态
-
 // Core 0 → Core 1 显示操作待处理标志（避免跨核直接调LCD/SPI）
 // 使用std::atomic确保双核SMP架构下的内存强一致性
 std::atomic<bool> g_pendingNormalMode{false};
@@ -53,7 +52,7 @@ std::atomic<bool> g_pendingPixelStop{false};
 std::atomic<bool> g_pendingPixelBufferLoad{false};
 std::atomic<uint8_t*> g_pendingPixelBufferPtr{nullptr};
 std::atomic<PixelPlayer*> g_pendingPixelPtr{nullptr};
-size_t g_pendingPixelSize = 0;
+std::atomic<size_t> g_pendingPixelSize{0};
 
 // ============ 前向声明 ============
 void parseServerData(String json);
@@ -65,6 +64,7 @@ void renderTask(void* pvParameters);
 void commTask(void* pvParameters) {
     Serial.println("[CommTask] Started on Core 0");
     unsigned long lastHeartbeat = 0;
+    bool isOffline = false;
     
     while (true) {
         unsigned long now = millis();
@@ -89,18 +89,18 @@ void commTask(void* pvParameters) {
                 g_displayData.connected = true;
                 g_displayData.lastUpdate = now;
                 g_lastDataReceived = now;
-                g_isOffline = false;
+                isOffline = false;
                 g_forceWake = true;  // 通知渲染任务唤醒屏幕
                 xSemaphoreGive(g_dataMutex);
             }
         }
 
         // 离线检测：45秒无数据 → OFFLINE
-        if (!g_isOffline && (now - g_lastDataReceived > OFFLINE_TIMEOUT_MS)) {
+        if (!isOffline && (now - g_lastDataReceived > OFFLINE_TIMEOUT_MS)) {
             if (xSemaphoreTake(g_dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 g_displayData.connected = false;
                 g_displayData.agent.status = STATUS_OFFLINE;
-                g_isOffline = true;
+                isOffline = true;
                 xSemaphoreGive(g_dataMutex);
             }
             Serial.println("[CommTask] 45s无数据，进入OFFLINE模式");
@@ -240,7 +240,7 @@ void renderTask(void* pvParameters) {
         // ===== 显示更新 =====
         if (now - lastDisplayUpdate >= UPDATE_INTERVAL) {
             lastDisplayUpdate = now;
-            if (g_isOffline && !pixelPlayer.isLoaded()) {
+            if (!localData.connected && !pixelPlayer.isLoaded()) {
                 // 离线模式：显示时钟+眨眼动画
                 display.drawClock();
             } else {
@@ -251,7 +251,7 @@ void renderTask(void* pvParameters) {
         // ===== 动画更新 =====
         if (now - lastAnimationUpdate >= ANIMATION_INTERVAL) {
             lastAnimationUpdate = now;
-            if (g_isOffline && !pixelPlayer.isLoaded()) {
+            if (!localData.connected && !pixelPlayer.isLoaded()) {
                 display.drawBlinkAnim();
             } else {
                 display.updateAnimation();
@@ -300,6 +300,10 @@ void setup() {
     // 初始化蜂鸣器
     Serial.println("[INIT] 初始化蜂鸣器...");
     sound.begin();
+    // 触摸反馈：任何触摸事件触发短促蜂鸣
+    touch.setCallback([](TouchEvent event) {
+        sound.beep(4500, 15);
+    });
     sound.playStartup();
     
     // 初始化触摸
@@ -326,10 +330,6 @@ void setup() {
     if (wifi.connect()) {
         Serial.println("[WiFi] Connected: " + wifi.getIP());
         display.showBootScreen("WiFi: " + wifi.getIP());
-        
-        // OTA标记：当前固件有效，取消回滚
-        esp_ota_mark_app_valid_cancel_rollback();
-        Serial.println("[OTA] Marked current firmware as valid");
         
         // 同步NTP时间（东八区）
         configTime(8 * 3600, 0, "ntp.aliyun.com", "ntp1.aliyun.com");
@@ -421,6 +421,14 @@ void parseServerData(String json) {
             g_displayData.agent.memoryMB = data["memory"] | 0.0;
             g_displayData.agent.uptimeSeconds = data["uptime"] | 0;
             xSemaphoreGive(g_dataMutex);
+        }
+        
+        // 首次成功解析status包 → 新固件健康，取消OTA回滚
+        static bool isOtaValidated = false;
+        if (!isOtaValidated) {
+            esp_ota_mark_app_valid_cancel_rollback();
+            isOtaValidated = true;
+            Serial.println("[OTA] New app validated successfully by server packet!");
         }
     }
     else if (type == "token") {

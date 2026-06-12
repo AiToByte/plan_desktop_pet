@@ -79,5 +79,8 @@ uint16_t TouchHandler::readValue() {
 
 bool TouchHandler::isTouched() {
     if (!_initialized) return false;
-    return (touchRead(TOUCH_PIN) < (_baseline - _threshold));
+    uint16_t current = touchRead(TOUCH_PIN);
+    // ESP32-S3触摸值可能高于基线，使用绝对差值法
+    uint16_t delta = abs((int32_t)_baseline - (int32_t)current);
+    return delta > _threshold;
 }

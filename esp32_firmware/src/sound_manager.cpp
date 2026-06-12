@@ -3,17 +3,29 @@
 SoundManager::SoundManager() : _enabled(true), _initialized(false) {}
 
 void SoundManager::begin() {
-    ledcSetup(0, 2000, 8);  // channel 0, 2kHz, 8-bit
+#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3,0,0)
+    // Arduino-ESP32 v3.x: 新统一API (pin, freq, resolution)
+    ledcAttach(BUZZER_PIN, 2000, 8);
+#else
+    // Arduino-ESP32 v2.x: 旧分离API (channel, freq, resolution)
+    ledcSetup(0, 2000, 8);
     ledcAttachPin(BUZZER_PIN, 0);
+#endif
     _initialized = true;
     Serial.println("[Sound] Initialized on GPIO " + String(BUZZER_PIN));
 }
 
 void SoundManager::beep(uint16_t freq, uint16_t duration) {
     if (!_enabled || !_initialized) return;
+#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3,0,0)
+    ledcWriteTone(BUZZER_PIN, freq);
+    delay(duration);
+    ledcWrite(BUZZER_PIN, 0);
+#else
     ledcWriteTone(0, freq);
     delay(duration);
     ledcWrite(0, 0);
+#endif
 }
 
 void SoundManager::beepPattern(uint16_t freq, uint16_t onMs, uint16_t offMs, uint8_t count) {

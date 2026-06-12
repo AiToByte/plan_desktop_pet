@@ -1,8 +1,10 @@
 #include "comm_manager.h"
+#include <WiFi.h>
 
 CommManager::CommManager() 
     : _connected(false), _hasNewData(false), _lastReconnect(0)
-    , _lastReceiveTime(0), _frameState(FRAME_IDLE)
+    , _lastReceiveTime(0), _reconnectInterval(RECONNECT_INTERVAL)
+    , _reconnectFailCount(0), _frameState(FRAME_IDLE)
     , _expectedLen(0) {
     _serverHost = "";
     _serverPort = SERVER_PORT;
@@ -40,6 +42,8 @@ bool CommManager::connect() {
         Serial.println("[Comm] Connected!");
         _connected = true;
         _frameState = FRAME_IDLE;
+        _reconnectFailCount = 0;           // 重置退避计数
+        _reconnectInterval = RECONNECT_INTERVAL;  // 重置退避间隔
         
         // 发送握手消息（使用帧协议）
         StaticJsonDocument<128> doc;
@@ -69,14 +73,30 @@ void CommManager::disconnect() {
 
 void CommManager::reconnect() {
     unsigned long now = millis();
-    if (now - _lastReconnect < RECONNECT_INTERVAL) {
+    if (now - _lastReconnect < _reconnectInterval) {
         return;
     }
     _lastReconnect = now;
+    _reconnectFailCount++;
     
-    Serial.println("[Comm] Reconnecting...");
+    // 连续失败10次 → WiFi硬重置（解决DHCP/关联状态异常）
+    if (_reconnectFailCount >= 10) {
+        Serial.println("[Comm] 10 failures, hard-resetting WiFi...");
+        WiFi.disconnect(true);
+        delay(200);
+        WiFi.begin();
+        _reconnectFailCount = 0;
+        _reconnectInterval = RECONNECT_INTERVAL;
+        return;
+    }
+    
+    Serial.printf("[Comm] Reconnecting #%d (backoff %lu ms)...\n",
+                  _reconnectFailCount, _reconnectInterval);
     disconnect();
     connect();
+    
+    // 指数退避：每次失败翻倍，上限60秒
+    _reconnectInterval = min(_reconnectInterval * 2, (unsigned long)60000);
 }
 
 void CommManager::update() {

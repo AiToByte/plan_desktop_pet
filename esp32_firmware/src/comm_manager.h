@@ -36,6 +36,8 @@ private:
     bool _hasNewData;
     unsigned long _lastReconnect;
     unsigned long _lastReceiveTime;  // 最后收到数据的时间戳
+    unsigned long _reconnectInterval; // 当前重连间隔（指数退避）
+    uint8_t _reconnectFailCount;     // 连续失败计数
     String _serverHost;
     int _serverPort;
     

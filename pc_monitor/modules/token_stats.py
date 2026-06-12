@@ -222,6 +222,12 @@ class TokenTracker:
                     tokens["timestamp"] = now
                     self._accumulated_records.append(tokens)
         
+        # 滑动窗口：仅保留最近24小时数据，防止长期运行内存泄漏
+        cutoff_time = now - 86400
+        self._accumulated_records = [
+            r for r in self._accumulated_records if r.get("timestamp", 0) > cutoff_time
+        ]
+        
         return self._accumulated_records
     
     def get_stats(self) -> TokenStats:
