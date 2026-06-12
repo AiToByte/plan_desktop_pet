@@ -45,7 +45,7 @@ private:
     String _frameBuffer;     // 累积完整帧payload
     int _expectedLen;        // 期望的payload长度
     
-    void processData(String data);
+    void processData(const String& data);
     void sendFramed(const String& json);  // 发送带长度前缀的帧
 };
 

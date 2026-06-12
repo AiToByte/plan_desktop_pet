@@ -45,7 +45,7 @@ class LogTailer:
         stat = os.stat(file_path)
         current_size = stat.st_size
         # Windows无inode，用文件大小+修改时间模拟
-        current_inode = int(stat.st_mtime * 1000)
+        current_inode = int(stat.st_ctime * 1000)
         
         state = self._file_states.get(file_path)
         

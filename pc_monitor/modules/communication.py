@@ -305,23 +305,35 @@ class WiFiCommunication(CommunicationBase):
                     break
                 
                 buffer += data
-                while '\n' in buffer:
-                    line, buffer = buffer.split('\n', 1)
-                    
+                
+                while buffer:
                     if expected_len is not None:
-                        payload_buf += line
-                        if len(payload_buf) >= expected_len:
-                            self._process_received(payload_buf[:expected_len])
+                        # Payload模式：直接按字节切片，不依赖换行符
+                        if len(buffer) >= expected_len:
+                            payload = buffer[:expected_len]
+                            buffer = buffer[expected_len:]
+                            self._process_received(payload)
                             expected_len = None
-                            payload_buf = ""
-                    elif line.startswith("LEN:"):
-                        try:
-                            expected_len = int(line[4:])
-                            payload_buf = ""
-                        except ValueError:
-                            logger.warning(f"Invalid LEN line: {line}")
-                    elif line.strip():
-                        self._process_received(line.strip())
+                            # 跳过紧跟的换行符（如果有）
+                            if buffer.startswith('\n'):
+                                buffer = buffer[1:]
+                        else:
+                            break  # 数据不足，等待更多
+                    else:
+                        # 长度头模式：按换行符读取LEN行
+                        nl_pos = buffer.find('\n')
+                        if nl_pos == -1:
+                            break  # 未收到完整行
+                        line = buffer[:nl_pos]
+                        buffer = buffer[nl_pos + 1:]
+                        
+                        if line.startswith("LEN:"):
+                            try:
+                                expected_len = int(line[4:])
+                            except ValueError:
+                                logger.warning(f"Invalid LEN line: {line}")
+                        elif line.strip():
+                            self._process_received(line.strip())
                         
             except socket.timeout:
                 continue

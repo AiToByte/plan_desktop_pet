@@ -38,6 +38,12 @@ bool g_screenDimmed = false;
 bool g_screenSleeping = false;
 bool g_forceWake = false;  // 通信收到数据时强制唤醒
 
+// Core 0 → Core 1 显示操作待处理标志（避免跨核直接调LCD/SPI）
+volatile bool g_pendingNormalMode = false;
+volatile bool g_pendingPixelPlay = false;
+volatile bool g_pendingPixelStop = false;
+PixelPlayer* g_pendingPixelPtr = nullptr;
+
 // ============ 前向声明 ============
 void parseServerData(String json);
 uint8_t parseStatus(String status);
@@ -86,7 +92,7 @@ void commTask(void* pvParameters) {
             }
             g_pxlCapacity = 0;
             g_pxlOffset = 0;
-            display.setNormalMode();
+            g_pendingNormalMode = true;  // Core 1将执行display.setNormalMode()
             comm.reconnect();
         }
         
@@ -149,6 +155,25 @@ void renderTask(void* pvParameters) {
         if (g_screenSleeping) {
             vTaskDelay(pdMS_TO_TICKS(500));  // 休眠时低频轮询
             continue;
+        }
+        
+        // ===== 处理来自Core 0的待执行显示操作 =====
+        if (g_pendingNormalMode) {
+            display.setNormalMode();
+            g_pendingNormalMode = false;
+            Serial.println("[Render] setNormalMode executed (pending)");
+        }
+        if (g_pendingPixelPlay && g_pendingPixelPtr) {
+            display.setPixelMode(g_pendingPixelPtr);
+            g_pendingPixelPtr->play();
+            g_pendingPixelPlay = false;
+            g_pendingPixelPtr = nullptr;
+            Serial.println("[Render] Pixel play executed (pending)");
+        }
+        if (g_pendingPixelStop) {
+            pixelPlayer.stop();
+            g_pendingPixelStop = false;
+            Serial.println("[Render] Pixel stop executed (pending)");
         }
         
         // ===== 显示更新 =====
@@ -339,9 +364,9 @@ void parseServerData(String json) {
 
         if (isLastChunk && g_pxlBuffer) {
             if (pixelPlayer.loadFromBuffer(g_pxlBuffer, g_pxlOffset)) {
-                display.setPixelMode(&pixelPlayer);
-                pixelPlayer.play();
-                Serial.printf("[Main] Pixel loaded: %d bytes, playing\n", g_pxlOffset);
+                g_pendingPixelPlay = true;
+                g_pendingPixelPtr = &pixelPlayer;
+                Serial.printf("[Main] Pixel loaded: %d bytes, pending play\n", g_pxlOffset);
             } else {
                 Serial.println("[Main] Pixel load failed");
             }
@@ -353,14 +378,14 @@ void parseServerData(String json) {
         String action = doc["action"] | "";
         if (action == "play") {
             if (pixelPlayer.isLoaded()) {
-                display.setPixelMode(&pixelPlayer);
-                pixelPlayer.play();
-                Serial.println("[Main] Pixel play");
+                g_pendingPixelPlay = true;
+                g_pendingPixelPtr = &pixelPlayer;
+                Serial.println("[Main] Pixel play requested");
             }
         }
         else if (action == "stop") {
-            pixelPlayer.stop();
-            display.setNormalMode();
+            g_pendingPixelStop = true;
+            g_pendingNormalMode = true;
             Serial.println("[Main] Pixel stop -> normal mode");
         }
         else if (action == "pause") {
