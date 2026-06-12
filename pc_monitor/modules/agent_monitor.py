@@ -1,8 +1,12 @@
 """
 AI Agent状态监控模块
 检测本地Agent进程状态（工作中/空闲/需授权）
+v2: 增加JSONL文件监控，精确检测auth pending状态
 """
 import psutil
+import os
+import glob
+import json
 import time
 import logging
 from typing import Dict, Optional
@@ -43,6 +47,12 @@ class AgentMonitor:
         self._cached_proc = None  # 缓存进程对象，避免cpu_percent永远返回0
         self._cpu_history = []
         self._idle_streak = 0
+        # JSONL auth检测配置
+        self._auth_jsonl_dirs = config.get("auth_jsonl_dirs", [
+            os.path.expanduser("~/.claude/projects")
+        ])
+        self._auth_jsonl_max_lines = config.get("auth_jsonl_max_lines", 30)
+        self._jsonl_auth_detected = False
         
     def _find_agent_process(self) -> Optional[psutil.Process]:
         """查找Agent进程"""
@@ -89,6 +99,51 @@ class AgentMonitor:
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             return AgentStatus.OFFLINE
     
+    def _check_auth_jsonl(self) -> bool:
+        """检查JSONL文件中是否有pending auth请求"""
+        for base_dir in self._auth_jsonl_dirs:
+            base_dir = os.path.expanduser(base_dir)
+            if not os.path.isdir(base_dir):
+                continue
+            # 找到最新的JSONL文件
+            jsonl_files = glob.glob(os.path.join(base_dir, "**", "*.jsonl"), recursive=True)
+            if not jsonl_files:
+                continue
+            # 按修改时间排序，只检查最新的
+            jsonl_files.sort(key=os.path.getmtime, reverse=True)
+            latest = jsonl_files[0]
+            try:
+                with open(latest, 'r', encoding='utf-8', errors='ignore') as f:
+                    lines = f.readlines()
+                # 只检查最后N行
+                for line in lines[-self._auth_jsonl_max_lines:]:
+                    try:
+                        obj = json.loads(line.strip())
+                        msg = obj.get("message", {})
+                        # 检测permission request（pending状态）
+                        if msg.get("type") == "permission_request":
+                            self._jsonl_auth_detected = True
+                            return True
+                        content = msg.get("content", "")
+                        if isinstance(content, str) and "permission" in content.lower() and "pending" in content.lower():
+                            self._jsonl_auth_detected = True
+                            return True
+                        # 检测tool_use AskUser无对应tool_result
+                        if isinstance(content, list):
+                            for item in content:
+                                if isinstance(item, dict) and item.get("type") == "tool_use":
+                                    tool_name = item.get("name", "")
+                                    if "AskUser" in tool_name or "ask" in tool_name.lower():
+                                        self._jsonl_auth_detected = True
+                                        return True
+                    except (json.JSONDecodeError, AttributeError):
+                        continue
+            except (IOError, OSError) as e:
+                logger.debug(f"读取JSONL失败 {latest}: {e}")
+                continue
+        self._jsonl_auth_detected = False
+        return False
+    
     def get_state(self) -> AgentState:
         """获取当前Agent状态"""
         # 1. 验证缓存的进程是否依然存活
@@ -128,6 +183,16 @@ class AgentMonitor:
                 create_time = proc.create_time()
                 
             status = self._analyze_cpu_pattern(proc)
+            
+            # JSONL auth检测优先：如果CPU判定为AUTHORIZING，用JSONL精确确认
+            if status == AgentStatus.AUTHORIZING:
+                if self._check_auth_jsonl():
+                    logger.debug("Auth确认: JSONL检测到pending permission")
+                # JSONL未确认auth但CPU低→保持AUTHORIZING（可能是等待输入）
+            elif status == AgentStatus.WORKING:
+                # 工作中也轻量检查JSONL（防止CPU刚升高但auth刚弹出的情况）
+                if self._check_auth_jsonl():
+                    status = AgentStatus.AUTHORIZING
             
             return AgentState(
                 status=status,

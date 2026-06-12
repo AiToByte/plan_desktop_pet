@@ -7,7 +7,9 @@ import os
 import re
 import time
 import json
+import glob
 import logging
+from pathlib import Path
 from typing import Dict, Optional, List
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -97,12 +99,19 @@ class TokenTracker:
     def __init__(self, config: dict):
         self.log_paths = config.get("log_paths", [])
         self.update_interval = config.get("update_interval", 30)
+        # JSONL自动发现配置
+        self.auto_discover = config.get("auto_discover", False)
+        self.auto_discover_dirs = config.get("auto_discover_dirs", [])
+        self.auto_discover_pattern = config.get("auto_discover_pattern", "*.jsonl")
         self._stats_history = []
         self._cached_stats = None
         self._last_scan_time = 0
         self._tailer = LogTailer()
         # 累积的token记录（增量追加，不重复扫描）
         self._accumulated_records: List[Dict] = []
+        # 自动发现的文件缓存
+        self._discovered_files: List[str] = []
+        self._discover_last_time: float = 0
         self._load_cache()
         
     def _load_cache(self):
@@ -115,6 +124,33 @@ class TokenTracker:
             except Exception as e:
                 logger.warning(f"加载缓存失败: {e}")
     
+    def _discover_log_files(self) -> List[str]:
+        """自动发现Claude CLI等AI工具的JSONL日志文件"""
+        if not self.auto_discover:
+            return []
+        
+        # 每60秒重新扫描一次，避免频繁IO
+        now = time.time()
+        if self._discovered_files and (now - self._discover_last_time) < 60:
+            return self._discovered_files
+        
+        found = []
+        for dir_pattern in self.auto_discover_dirs:
+            expanded = os.path.expanduser(os.path.expandvars(dir_pattern))
+            pattern = os.path.join(expanded, "**", self.auto_discover_pattern)
+            matches = glob.glob(pattern, recursive=True)
+            found.extend(matches)
+        
+        # 按修改时间降序，只保留最新的3个文件
+        found.sort(key=lambda f: os.path.getmtime(f) if os.path.exists(f) else 0, reverse=True)
+        self._discovered_files = found[:3]
+        self._discover_last_time = now
+        
+        if self._discovered_files:
+            logger.info(f"自动发现 {len(self._discovered_files)} 个JSONL文件")
+        
+        return self._discovered_files
+    
     def _save_cache(self):
         """保存统计数据到缓存"""
         try:
@@ -124,14 +160,24 @@ class TokenTracker:
             logger.warning(f"保存缓存失败: {e}")
     
     def _parse_log_line(self, line: str) -> Optional[Dict]:
-        """解析日志行，提取Token使用信息"""
-        # 匹配常见的Token日志格式
+        """解析日志行，提取Token使用信息（支持JSONL和纯文本）"""
+        # 优先尝试JSONL格式（Claude CLI输出）
+        try:
+            obj = json.loads(line)
+            msg = obj.get("message", {})
+            usage = msg.get("usage", {})
+            if usage and ("input_tokens" in usage or "output_tokens" in usage):
+                return {
+                    "input_tokens": int(usage.get("input_tokens", 0)),
+                    "output_tokens": int(usage.get("output_tokens", 0))
+                }
+        except (json.JSONDecodeError, AttributeError, ValueError):
+            pass
+        
+        # fallback: 正则匹配纯文本格式
         patterns = [
-            # 格式: "tokens: input=1234 output=5678"
             r'tokens?:\s*input[=:]\s*(\d+)\s*output[=:]\s*(\d+)',
-            # 格式: "prompt_tokens=1234, completion_tokens=5678"
             r'prompt_tokens?[=:]\s*(\d+).*?completion_tokens?[=:]\s*(\d+)',
-            # 格式: "usage: {input_tokens: 1234, output_tokens: 5678}"
             r'input_tokens[=:]\s*(\d+).*?output_tokens[=:]\s*(\d+)',
         ]
         
@@ -145,29 +191,36 @@ class TokenTracker:
         return None
     
     def _scan_log_files(self) -> list:
-        """增量扫描日志文件，仅读取新增内容（v2: LogTailer）"""
+        """增量扫描日志文件，仅读取新增内容（v2: LogTailer + 自动发现）"""
         now = time.time()
         
+        # 合并手动配置路径和自动发现的文件
+        all_files = []
         for log_path in self.log_paths:
             if not os.path.exists(log_path):
                 continue
-                
             if os.path.isfile(log_path):
-                files = [log_path]
+                all_files.append(log_path)
             else:
-                files = [
+                all_files.extend(
                     os.path.join(log_path, f) 
                     for f in os.listdir(log_path) 
-                    if f.endswith(('.log', '.txt', '.json'))
-                ]
-            
-            for file_path in files:
-                new_lines = self._tailer.read_new_lines(file_path)
-                for line in new_lines:
-                    tokens = self._parse_log_line(line)
-                    if tokens:
-                        tokens["timestamp"] = now
-                        self._accumulated_records.append(tokens)
+                    if f.endswith(('.log', '.txt', '.json', '.jsonl'))
+                )
+        
+        # 追加自动发现的JSONL文件
+        discovered = self._discover_log_files()
+        for df in discovered:
+            if df not in all_files:
+                all_files.append(df)
+        
+        for file_path in all_files:
+            new_lines = self._tailer.read_new_lines(file_path)
+            for line in new_lines:
+                tokens = self._parse_log_line(line)
+                if tokens:
+                    tokens["timestamp"] = now
+                    self._accumulated_records.append(tokens)
         
         return self._accumulated_records
     

@@ -42,7 +42,7 @@ bool CommManager::connect() {
         _frameState = FRAME_IDLE;
         
         // 发送握手消息（使用帧协议）
-        DynamicJsonDocument doc(256);
+        StaticJsonDocument<128> doc;
         doc["type"] = "handshake";
         doc["device"] = "esp32s3";
         doc["version"] = "2.0.0";  // v2: 长度前缀帧协议

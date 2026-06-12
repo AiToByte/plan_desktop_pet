@@ -10,6 +10,59 @@ void WiFiManager::begin() {
     _webConfig.begin();
 }
 
+bool WiFiManager::tryUDPDiscovery(unsigned long timeoutMs) {
+    WiFiUDP udp;
+    // 使用与PC端相同的广播端口
+    if (!udp.begin(19877)) {
+        Serial.println("[WiFi] UDP Discovery: 监听端口失败");
+        return false;
+    }
+    
+    Serial.printf("[WiFi] UDP Discovery: 监听端口 19877，超时 %lu ms\n", timeoutMs);
+    
+    unsigned long start = millis();
+    char buf[128];
+    
+    while (millis() - start < timeoutMs) {
+        int packetSize = udp.parsePacket();
+        if (packetSize > 0 && packetSize < (int)sizeof(buf)) {
+            int len = udp.read(buf, sizeof(buf) - 1);
+            buf[len] = '\0';
+            
+            // 格式: DESKTOP_PET_SERVER:IP:PORT
+            String msg = String(buf);
+            if (msg.startsWith("DESKTOP_PET_SERVER:")) {
+                String payload = msg.substring(19); // 跳过前缀
+                int colonIdx = payload.indexOf(':');
+                if (colonIdx > 0) {
+                    String ip = payload.substring(0, colonIdx);
+                    int port = payload.substring(colonIdx + 1).toInt();
+                    
+                    if (ip.length() > 0 && port > 0) {
+                        Serial.printf("[WiFi] UDP Discovery: 发现服务器 %s:%d\n", ip.c_str(), port);
+                        
+                        // 保存到WebConfig (通过Preferences直接写)
+                        Preferences prefs;
+                        prefs.begin("webconfig", false);
+                        prefs.putString("server_host", ip);
+                        prefs.putInt("server_port", port);
+                        prefs.putBool("has_config", true);
+                        prefs.end();
+                        
+                        udp.stop();
+                        return true;
+                    }
+                }
+            }
+        }
+        delay(10);
+    }
+    
+    udp.stop();
+    Serial.println("[WiFi] UDP Discovery: 超时，未发现服务器");
+    return false;
+}
+
 bool WiFiManager::connect() {
     // 优先使用保存的配置连接
     if (_webConfig.connectFromSaved()) {
@@ -18,8 +71,19 @@ bool WiFiManager::connect() {
         return true;
     }
     
-    // 保存的配置失败，进入配网模式
-    Serial.println("[WiFi] Saved config failed, starting config mode...");
+    // 保存的配置失败，尝试UDP自动发现PC服务器
+    Serial.println("[WiFi] Saved config failed, trying UDP discovery...");
+    if (tryUDPDiscovery()) {
+        Serial.println("[WiFi] UDP discovery OK, retrying connection...");
+        if (_webConfig.connectFromSaved()) {
+            _connected = true;
+            _configMode = false;
+            return true;
+        }
+    }
+    
+    // 自动发现也失败，进入配网模式
+    Serial.println("[WiFi] UDP discovery failed, starting config mode...");
     startConfigMode();
     return false;
 }

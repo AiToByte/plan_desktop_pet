@@ -171,11 +171,14 @@ class WiFiCommunication(CommunicationBase):
         self.host = config.get("wifi_host", "0.0.0.0")
         self.port = config.get("wifi_port", 19876)
         self.retry_interval = config.get("retry_interval", 5)
+        self.udp_broadcast_port = config.get("udp_broadcast_port", 19877)
+        self.udp_broadcast_interval = config.get("udp_broadcast_interval", 5)
         self._server_socket: Optional[socket.socket] = None
         self._client_socket: Optional[socket.socket] = None
         self._client_addr: Optional[tuple] = None
         self._accept_thread: Optional[threading.Thread] = None
         self._read_thread: Optional[threading.Thread] = None
+        self._udp_broadcast_thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
     
     def connect(self) -> bool:
@@ -194,7 +197,11 @@ class WiFiCommunication(CommunicationBase):
             self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
             self._accept_thread.start()
             
-            logger.info(f"TCP Server 已启动，监听 {self.host}:{self.port}，等待ESP32连接...")
+            # 启动UDP广播线程（设备自动发现）
+            self._udp_broadcast_thread = threading.Thread(target=self._udp_broadcast_loop, daemon=True)
+            self._udp_broadcast_thread.start()
+            
+            logger.info(f"TCP Server 已启动，监听 {self.host}:{self.port}，UDP广播端口 {self.udp_broadcast_port}")
             return True
             
         except Exception as e:
@@ -235,6 +242,46 @@ class WiFiCommunication(CommunicationBase):
                 if self._running:
                     logger.error(f"接受连接错误: {e}")
                 time.sleep(1)
+    
+    def _get_local_ip(self) -> str:
+        """获取本机局域网IP地址"""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return "127.0.0.1"
+    
+    def _udp_broadcast_loop(self):
+        """UDP广播循环：每N秒向局域网广播服务器地址"""
+        local_ip = self._get_local_ip()
+        msg = f"DESKTOP_PET_SERVER:{local_ip}:{self.port}"
+        
+        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        udp_sock.settimeout(1)
+        
+        logger.info(f"UDP广播已启动: {msg} -> port {self.udp_broadcast_port}")
+        
+        while self._running:
+            try:
+                udp_sock.sendto(msg.encode('utf-8'), ('<broadcast>', self.udp_broadcast_port))
+            except Exception as e:
+                logger.warning(f"UDP广播发送失败: {e}")
+            
+            # 分段sleep，快速响应_running变化
+            for _ in range(int(self.udp_broadcast_interval * 10)):
+                if not self._running:
+                    break
+                time.sleep(0.1)
+        
+        try:
+            udp_sock.close()
+        except:
+            pass
+        logger.info("UDP广播已停止")
     
     def disconnect(self):
         """断开连接并关闭服务器"""

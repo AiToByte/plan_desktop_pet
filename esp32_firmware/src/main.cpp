@@ -132,17 +132,21 @@ void renderTask(void* pvParameters) {
         unsigned long timeSinceData = now - g_lastDataReceived;
         
         if (needWake && (g_screenDimmed || g_screenSleeping)) {
-            // 数据到达 → 唤醒屏幕
+            // 数据到达 → 唤醒屏幕 + 恢复全速CPU + WiFi活跃
+            setCpuFrequencyMhz(240);
+            WiFi.setSleep(false);
             display.wakeup();
             g_screenDimmed = false;
             g_screenSleeping = false;
-            Serial.println("[Render] Screen wake (data received)");
+            Serial.println("[Render] Screen wake (data received), CPU 240MHz, WiFi active");
         } else if (!g_screenSleeping && timeSinceData > SCREEN_SLEEP_TIMEOUT) {
-            // 超时 → 进入休眠
+            // 超时 → 进入休眠 + 降频CPU + WiFi节能
+            setCpuFrequencyMhz(80);
+            WiFi.setSleep(true);
             display.sleep();
             g_screenSleeping = true;
             g_screenDimmed = true;
-            Serial.println("[Render] Screen sleep (timeout)");
+            Serial.println("[Render] Screen sleep (timeout), CPU 80MHz, WiFi sleep");
             vTaskDelay(pdMS_TO_TICKS(1000));  // 休眠后降低刷新率
             continue;
         } else if (!g_screenDimmed && timeSinceData > SCREEN_DIM_TIMEOUT) {
@@ -280,19 +284,27 @@ void loop() {
 }
 
 // ============ 数据解析 ============
+
 void parseServerData(String json) {
-    DynamicJsonDocument doc(1024);
-    DeserializationError error = deserializeJson(doc, json);
+    // --- Phase 1: 快速提取type字段（最小64字节分配）---
+    StaticJsonDocument<64> typeDoc;
+    deserializeJson(typeDoc, json);
+    String type = typeDoc["type"] | "unknown";
     
-    if (error) {
-        Serial.print("[JSON] Parse error: ");
-        Serial.println(error.c_str());
-        return;
-    }
-    
-    String type = doc["type"] | "unknown";
-    
+    // --- Phase 2: 按类型过滤解析 ---
     if (type == "status") {
+        StaticJsonDocument<256> filter;
+        filter["type"] = true;
+        filter["data"]["status"] = true;
+        filter["data"]["process"] = true;
+        filter["data"]["cpu"] = true;
+        filter["data"]["memory"] = true;
+        filter["data"]["uptime"] = true;
+        
+        StaticJsonDocument<256> doc;
+        DeserializationError error = deserializeJson(doc, json, DeserializationOption::Filter(filter));
+        if (error) { Serial.printf("[JSON] status parse error: %s\n", error.c_str()); return; }
+        
         JsonObject data = doc["data"];
         if (xSemaphoreTake(g_dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             g_displayData.agent.status = parseStatus(data["status"] | "offline");
@@ -304,6 +316,18 @@ void parseServerData(String json) {
         }
     }
     else if (type == "token") {
+        StaticJsonDocument<256> filter;
+        filter["type"] = true;
+        filter["data"]["input"] = true;
+        filter["data"]["output"] = true;
+        filter["data"]["requests"] = true;
+        filter["data"]["hour"] = true;
+        filter["data"]["cost"] = true;
+        
+        StaticJsonDocument<256> doc;
+        DeserializationError error = deserializeJson(doc, json, DeserializationOption::Filter(filter));
+        if (error) { Serial.printf("[JSON] token parse error: %s\n", error.c_str()); return; }
+        
         JsonObject data = doc["data"];
         if (xSemaphoreTake(g_dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             g_displayData.tokens.inputTokens = data["input"] | 0;
@@ -315,6 +339,20 @@ void parseServerData(String json) {
         }
     }
     else if (type == "weather") {
+        StaticJsonDocument<384> filter;
+        filter["type"] = true;
+        filter["data"]["city"] = true;
+        filter["data"]["temp"] = true;
+        filter["data"]["feels_like"] = true;
+        filter["data"]["humidity"] = true;
+        filter["data"]["desc"] = true;
+        filter["data"]["icon"] = true;
+        filter["data"]["wind"] = true;
+        
+        StaticJsonDocument<384> doc;
+        DeserializationError error = deserializeJson(doc, json, DeserializationOption::Filter(filter));
+        if (error) { Serial.printf("[JSON] weather parse error: %s\n", error.c_str()); return; }
+        
         JsonObject data = doc["data"];
         if (xSemaphoreTake(g_dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             g_displayData.weather.city = data["city"] | "";
@@ -328,11 +366,15 @@ void parseServerData(String json) {
         }
     }
     else if (type == "pixel_data") {
+        // pixel_data包含二进制Base64，用DynamicJsonDocument无法过滤，保持原分配
+        DynamicJsonDocument doc(1024);
+        DeserializationError error = deserializeJson(doc, json);
+        if (error) { Serial.printf("[JSON] pixel_data parse error: %s\n", error.c_str()); return; }
+        
         String pxlBase64 = doc["data"] | "";
         int chunkIndex = doc["chunk"] | 0;
         bool isLastChunk = doc["last"] | false;
 
-        // 第一包：初始化缓冲区
         if (chunkIndex == 0) {
             if (g_pxlBuffer) { free(g_pxlBuffer); g_pxlBuffer = nullptr; }
             g_pxlCapacity = 4096;
@@ -345,7 +387,6 @@ void parseServerData(String json) {
             return;
         }
 
-        // Base64解码
         size_t decodedLen = pxlBase64.length() * 3 / 4 + 3;
         while (g_pxlOffset + decodedLen > g_pxlCapacity) {
             g_pxlCapacity *= 2;
@@ -375,6 +416,11 @@ void parseServerData(String json) {
         }
     }
     else if (type == "pixel_cmd") {
+        // pixel_cmd字段少且固定，用StaticJsonDocument即可
+        StaticJsonDocument<128> doc;
+        DeserializationError error = deserializeJson(doc, json);
+        if (error) { Serial.printf("[JSON] pixel_cmd parse error: %s\n", error.c_str()); return; }
+        
         String action = doc["action"] | "";
         if (action == "play") {
             if (pixelPlayer.isLoaded()) {

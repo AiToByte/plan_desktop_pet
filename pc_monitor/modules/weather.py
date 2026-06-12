@@ -58,10 +58,25 @@ class WeatherService:
         self.api_key = config.get("api_key", "")
         self.city = config.get("city", "Beijing")
         self.update_interval = config.get("update_interval", 1800)
+        self.update_interval_idle = config.get("update_interval_idle", 3600)     # 空闲时刷新间隔(秒)
+        self.update_interval_working = config.get("update_interval_working", 600) # 工作中刷新间隔(秒)
         self.cache_file = config.get("cache_file", "weather_cache.json")
         self._cached_weather = None
         self._last_update = 0
+        self._agent_status = "idle"  # 当前Agent状态
         self._load_cache()
+    
+    def set_agent_status(self, status: str):
+        """设置当前Agent状态，影响天气刷新频率"""
+        self._agent_status = status
+    
+    def _get_effective_interval(self) -> int:
+        """根据Agent状态返回对应的刷新间隔"""
+        if self._agent_status == "working":
+            return self.update_interval_working
+        elif self._agent_status in ("idle", "offline"):
+            return self.update_interval_idle
+        return self.update_interval  # 默认间隔
     
     def _load_cache(self):
         """加载天气缓存"""
@@ -85,8 +100,9 @@ class WeatherService:
         """获取天气信息"""
         now = time.time()
         
-        # 检查缓存是否有效
-        if self._cached_weather and (now - self._last_update) < self.update_interval:
+        # 检查缓存是否有效（根据Agent状态动态调整间隔）
+        effective_interval = self._get_effective_interval()
+        if self._cached_weather and (now - self._last_update) < effective_interval:
             return self._parse_weather(self._cached_weather)
         
         # 检查API Key
