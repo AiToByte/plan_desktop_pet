@@ -111,8 +111,8 @@ void DisplayManager::updateAnimation() {
         // 重绘表情
         drawFace(faceX, faceY, _currentFace, _animFrame);
 
-        // 提交局部刷新区域到屏幕（仅动画区域，降低70% SPI带宽）
-        _sprite.pushSprite(&_lcd, 0, faceY - 4, 0, faceY - 4, SCREEN_WIDTH, FACE_SIZE + 8);
+        // 提交局部刷新区域到屏幕（LovyanGFX不支持区域pushSprite，推送全屏）
+        _sprite.pushSprite(&_lcd, 0, 0);
     }
 }
 
@@ -809,21 +809,23 @@ void DisplayManager::drawClock() {
     time_t now;
     struct tm timeinfo;
     time(&now);
-    localtime_r(&timeinfo, &now);
+    localtime_r(&now, &timeinfo);
 
     char timeStr[6];
     snprintf(timeStr, sizeof(timeStr), "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
 
     _sprite.fillScreen(COLOR_BG);
 
-    // 大号居中时钟
-    _sprite.setTextSize(4);
+    // 大号居中时钟 (fonts::Font2: 16px高清字体，抗锯齿，比Font0+textSize4清晰)
+    _sprite.setFont(&fonts::Font2);
     _sprite.setTextColor(COLOR_TEXT, COLOR_BG);
-    int textW = strlen(timeStr) * 6 * 4;  // 6px/char * textSize4
+    int charW = 16;  // Font2 每字符约16px宽
+    int textW = strlen(timeStr) * charW;
     int tx = (SCREEN_WIDTH - textW) / 2;
     int ty = SCREEN_HEIGHT / 2 - 16;
     _sprite.setCursor(tx, ty);
     _sprite.print(timeStr);
+    _sprite.setFont(nullptr);  // 恢复默认字体
 
     // 底部小字 "OFFLINE"
     _sprite.setTextSize(1);

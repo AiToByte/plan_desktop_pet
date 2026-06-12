@@ -223,9 +223,9 @@ class DesktopPetMonitor:
         """处理OTLP接收的span，转发给ESP32显示"""
         status_mapping = {
             "agent.idle": "idle",
-            "agent.thinking": "busy",
-            "agent.generating": "busy",
-            "agent.tool_call": "busy",
+            "agent.thinking": "working",
+            "agent.generating": "working",
+            "agent.tool_call": "working",
             "agent.waiting": "idle",
             "agent.error": "offline",
             "agent.complete": "idle",
@@ -240,15 +240,15 @@ class DesktopPetMonitor:
             "agent.complete": "完成",
         }
         
-        if span.span_name not in status_mapping:
+        if span.name not in status_mapping:
             return
         
-        device_status = status_mapping[span.span_name]
-        detail = detail_mapping.get(span.span_name, "")
+        device_status = status_mapping[span.name]
+        detail = detail_mapping.get(span.name, "")
         
-        # 工具调用时优先用custom_detail
-        if span.span_name == "agent.tool_call" and span.custom_detail:
-            detail = span.custom_detail
+        # 工具调用时优先用自定义detail
+        if span.name == "agent.tool_call" and span.attributes.get('agent.detail'):
+            detail = span.attributes.get('agent.detail')
         
         msg = DeviceMessage(
             msg_type="status",
@@ -263,7 +263,7 @@ class DesktopPetMonitor:
         
         if self.communication.is_connected():
             self.communication.send_message(msg)
-            logger.debug(f"OTLP转发: {span.span_name} → {device_status}")
+            logger.debug(f"OTLP转发: {span.name} → {device_status}")
 
 
 def main():

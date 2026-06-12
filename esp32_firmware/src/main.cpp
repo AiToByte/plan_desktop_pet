@@ -7,12 +7,15 @@
 
 #include <Arduino.h>
 #include <atomic>
+#include <mbedtls/base64.h>
 #include "config.h"
 #include "types.h"
 #include "display_manager.h"
 #include "pixel_player.h"
 #include "wifi_manager.h"
 #include "comm_manager.h"
+#include "sound_manager.h"
+#include "touch_handler.h"
 
 // ============ 共享数据 (mutex保护) ============
 DisplayData g_displayData;
@@ -28,6 +31,8 @@ DisplayManager display;
 WiFiManager wifi;
 CommManager comm;
 PixelPlayer pixelPlayer;
+SoundManager sound;
+TouchHandler touch;
 
 // 任务句柄
 TaskHandle_t g_commTaskHandle = NULL;
@@ -45,7 +50,10 @@ bool g_isOffline = false;  // 45秒无数据→离线状态
 std::atomic<bool> g_pendingNormalMode{false};
 std::atomic<bool> g_pendingPixelPlay{false};
 std::atomic<bool> g_pendingPixelStop{false};
+std::atomic<bool> g_pendingPixelBufferLoad{false};
+std::atomic<uint8_t*> g_pendingPixelBufferPtr{nullptr};
 std::atomic<PixelPlayer*> g_pendingPixelPtr{nullptr};
+size_t g_pendingPixelSize = 0;
 
 // ============ 前向声明 ============
 void parseServerData(String json);
@@ -202,8 +210,8 @@ void renderTask(void* pvParameters) {
             Serial.println("[Render] setNormalMode executed (pending)");
         }
         if (g_pendingPixelPlay && g_pendingPixelPtr) {
-            display.setPixelMode(g_pendingPixelPtr);
-            g_pendingPixelPtr->play();
+            display.setPixelMode(g_pendingPixelPtr.load());
+            g_pendingPixelPtr.load()->play();
             g_pendingPixelPlay = false;
             g_pendingPixelPtr = nullptr;
             Serial.println("[Render] Pixel play executed (pending)");
@@ -212,6 +220,21 @@ void renderTask(void* pvParameters) {
             pixelPlayer.stop();
             g_pendingPixelStop = false;
             Serial.println("[Render] Pixel stop executed (pending)");
+        }
+        if (g_pendingPixelBufferLoad && g_pendingPixelBufferPtr) {
+            // Core 0 传来的像素缓冲区，在 Core 1 自己的时间片内加载
+            uint8_t* buf = g_pendingPixelBufferPtr;
+            g_pendingPixelBufferPtr = nullptr;
+            size_t sz = g_pendingPixelSize;
+            if (pixelPlayer.loadFromBuffer(buf, sz)) {
+                g_pendingPixelPlay = true;
+                g_pendingPixelPtr = &pixelPlayer;
+                Serial.printf("[Render] Pixel loaded on Core 1: %d bytes, pending play\n", sz);
+            } else {
+                Serial.println("[Render] Pixel load failed on Core 1");
+            }
+            free(buf);
+            g_pendingPixelBufferLoad = false;
         }
         
         // ===== 显示更新 =====
@@ -235,7 +258,20 @@ void renderTask(void* pvParameters) {
             }
         }
         
-        vTaskDelay(pdMS_TO_TICKS(20));  // ~50fps上限
+        // VRR动态帧率：根据状态调整延迟
+        uint32_t frameDelay = 20;  // ACTIVE: 50fps
+        if (g_screenSleeping) {
+            frameDelay = 500;       // SLEEP: 2fps
+        } else if (g_screenDimmed) {
+            frameDelay = 1000;      // DIM: 1fps
+        } else if (millis() - g_lastDataReceived > SCREEN_DIM_TIMEOUT / 2) {
+            frameDelay = 200;       // IDLE: 5fps (数据静默>15秒)
+        }
+        
+        // 触摸检测
+        touch.update();
+        
+        vTaskDelay(pdMS_TO_TICKS(frameDelay));
     }
 }
 
@@ -258,8 +294,29 @@ void setup() {
     // 初始化显示
     Serial.println("[INIT] 初始化显示...");
     display.begin();
-    pixelPlayer.begin();
+    // PixelPlayer 构造函数已自动初始化，无需 begin()
     display.showBootScreen("Initializing...");
+    
+    // 初始化蜂鸣器
+    Serial.println("[INIT] 初始化蜂鸣器...");
+    sound.begin();
+    sound.playStartup();
+    
+    // 初始化触摸
+    Serial.println("[INIT] 初始化触摸...");
+    touch.begin();
+    touch.setCallback([](TouchEvent e) {
+        if (e == TOUCH_SINGLE_TAP) {
+            sound.playNotification();
+            Serial.println("[Touch] Single tap");
+        } else if (e == TOUCH_DOUBLE_TAP) {
+            sound.playNotification();
+            Serial.println("[Touch] Double tap");
+        } else if (e == TOUCH_LONG_PRESS) {
+            sound.playAlert();
+            Serial.println("[Touch] Long press");
+        }
+    });
     
     // 初始化WiFi
     Serial.println("[INIT] 连接WiFi...");
@@ -269,6 +326,10 @@ void setup() {
     if (wifi.connect()) {
         Serial.println("[WiFi] Connected: " + wifi.getIP());
         display.showBootScreen("WiFi: " + wifi.getIP());
+        
+        // OTA标记：当前固件有效，取消回滚
+        esp_ota_mark_app_valid_cancel_rollback();
+        Serial.println("[OTA] Marked current firmware as valid");
         
         // 同步NTP时间（东八区）
         configTime(8 * 3600, 0, "ntp.aliyun.com", "ntp1.aliyun.com");
@@ -446,20 +507,27 @@ void parseServerData(String json) {
             g_pxlBuffer = newBuf;
         }
 
-        size_t written = base64_decode(g_pxlBuffer + g_pxlOffset, pxlBase64.c_str(), pxlBase64.length());
+        // 使用mbedtls进行base64解码（ESP32 Arduino内置）
+        size_t written = 0;
+        mbedtls_base64_decode(g_pxlBuffer + g_pxlOffset,
+                              (size_t)(g_pxlCapacity - g_pxlOffset),
+                              &written,
+                              (const unsigned char*)pxlBase64.c_str(),
+                              pxlBase64.length());
         g_pxlOffset += written;
         Serial.printf("[Main] Pixel chunk %d decoded: %d bytes, total %d\n", chunkIndex, written, g_pxlOffset);
 
         if (isLastChunk && g_pxlBuffer) {
-            if (pixelPlayer.loadFromBuffer(g_pxlBuffer, g_pxlOffset)) {
-                g_pendingPixelPlay = true;
-                g_pendingPixelPtr = &pixelPlayer;
-                Serial.printf("[Main] Pixel loaded: %d bytes, pending play\n", g_pxlOffset);
-            } else {
-                Serial.println("[Main] Pixel load failed");
-            }
-            free(g_pxlBuffer); g_pxlBuffer = nullptr;
+            // 不在 Core 0 直接 loadFromBuffer —— Core 1 渲染循环可能正在访问 pixelPlayer
+            // 将缓冲区指针传递给 Core 1，由它在自己的时间片内加载，加载后释放
+            g_pendingPixelBufferPtr = g_pxlBuffer;
+            g_pendingPixelSize = g_pxlOffset;
+            g_pendingPixelBufferLoad.store(true);
+            Serial.printf("[Main] Pixel buffer ready (%d bytes), pending load on Core 1\n", g_pxlOffset);
+            // 不释放 g_pxlBuffer —— Core 1 load 完成后负责 free
+            g_pxlBuffer = nullptr;
             g_pxlOffset = 0;
+            g_pxlCapacity = 0;
         }
     }
     else if (type == "pixel_cmd") {

@@ -181,6 +181,19 @@ class WiFiCommunication(CommunicationBase):
         self._udp_broadcast_thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
     
+    @staticmethod
+    def resolve_mdns(hostname: str = "deskpet.local") -> Optional[str]:
+        """通过mDNS解析设备主机名，返回IP或None"""
+        try:
+            addr = socket.getaddrinfo(hostname, None, socket.AF_INET)
+            if addr:
+                ip = addr[0][4][0]
+                logger.info(f"mDNS解析 {hostname} -> {ip}")
+                return ip
+        except (socket.gaierror, OSError):
+            logger.debug(f"mDNS解析 {hostname} 失败")
+        return None
+    
     def connect(self) -> bool:
         """启动TCP Server，等待ESP32连接"""
         try:

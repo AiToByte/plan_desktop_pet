@@ -68,9 +68,10 @@ void WebConfig::startAPMode() {
     _server->on("/reset", HTTP_GET, [this]() { handleReset(); });
     _server->on("/status", HTTP_GET, [this]() { handleStatus(); });
     
-    // OTA固件升级路由
+    // OTA固件升级路由（支持回滚）
     _server->on("/ota", HTTP_GET, [this]() { handleOTA(); });
-    _server->on("/update", HTTP_POST, [this]() { handleOTAUpload(); }, [this]() { /* multipart handler handled internally */ });
+    _server->on("/update", HTTP_POST, [this]() { handleOTAUpload(); }, [this]() { /* multipart handler */ });
+    _server->on("/rollback", HTTP_POST, [this]() { handleOTARollback(); });
     
     _server->begin();
     _state = CONFIG_AP_MODE;
@@ -555,6 +556,8 @@ void WebConfig::handleOTAUpload() {
 
     if (upload.status == UPLOAD_FILE_START) {
         Serial.printf("[OTA] Start: %s\n", upload.filename.c_str());
+        // 记录当前运行分区，用于回滚
+        _otaPrevPartition = esp_ota_get_running_partition();
         if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
             Update.printError(Serial);
         }
@@ -567,19 +570,43 @@ void WebConfig::handleOTAUpload() {
     else if (upload.status == UPLOAD_FILE_END) {
         if (Update.end(true)) {
             Serial.printf("[OTA] Success: %u bytes\n", upload.totalSize);
+            // 标记OTA应用镜像有效，取消回滚
+            esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+            if (err != ESP_OK) {
+                Serial.printf("[OTA] Mark valid failed: %d\n", err);
+            }
         } else {
             Update.printError(Serial);
+            // 更新失败，设置回滚到之前的分区
+            if (_otaPrevPartition) {
+                esp_ota_set_boot_partition(_otaPrevPartition);
+                Serial.println("[OTA] Rollback to previous partition");
+            }
         }
     }
 
     // 上传完成后发送响应
     if (upload.status == UPLOAD_FILE_END) {
         if (Update.hasError()) {
-            _server->send(500, "text/plain", "升级失败");
+            _server->send(500, "text/plain", "升级失败，已回滚");
         } else {
             _server->send(200, "text/plain", "升级成功");
             delay(1000);
             ESP.restart();
         }
+    }
+}
+
+void WebConfig::handleOTARollback() {
+    // OTA回滚：重启到上一个有效的应用分区
+    const esp_partition_t* prev = esp_ota_get_last_invalid_partition();
+    if (prev) {
+        Serial.println("[OTA] Rolling back to previous partition...");
+        esp_ota_set_boot_partition(prev);
+        _server->send(200, "text/plain", "回滚成功，设备即将重启...");
+        delay(1000);
+        ESP.restart();
+    } else {
+        _server->send(400, "text/plain", "没有可回滚的分区");
     }
 }

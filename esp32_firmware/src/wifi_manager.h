@@ -37,6 +37,8 @@ private:
     bool _connected;
     unsigned long _lastAttempt;
     bool _configMode;
+    
+    void _startMDNS();
 };
 
 #endif

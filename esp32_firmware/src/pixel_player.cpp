@@ -73,7 +73,7 @@ bool PixelPlayer::loadFromBuffer(const uint8_t* data, size_t len) {
     }
 
     // 拷贝头部
-    memcpy(&_header, data, PXL_FILE_HEADER_SIZE);
+    memcpy(&_header, data, PXL_HEADER_SIZE);
 
     // 设置默认帧间隔
     if (_header.frame_interval == 0) {
@@ -94,8 +94,8 @@ bool PixelPlayer::loadFromBuffer(const uint8_t* data, size_t len) {
     if (_header.flags & PXL_FLAG_RLE) {
         // RLE压缩数据：需逐帧解压
         size_t pixelsPerFrame = (size_t)_header.width * _header.height;
-        const uint8_t* src = data + PXL_FILE_HEADER_SIZE;
-        size_t remaining = len - PXL_FILE_HEADER_SIZE;
+        const uint8_t* src = data + PXL_HEADER_SIZE;
+        size_t remaining = len - PXL_HEADER_SIZE;
 
         for (uint16_t f = 0; f < _header.frame_count; f++) {
             uint16_t* dst = _frameBuffer + f * pixelsPerFrame;
@@ -124,7 +124,7 @@ bool PixelPlayer::loadFromBuffer(const uint8_t* data, size_t len) {
         Serial.printf("[PixelPlayer] RLE decompressed %d frames OK\n", _header.frame_count);
     } else {
         // 原始未压缩数据：直接拷贝
-        memcpy(_frameBuffer, data + PXL_FILE_HEADER_SIZE, totalSize);
+        memcpy(_frameBuffer, data + PXL_HEADER_SIZE, totalSize);
     }
 
     _currentFrame = 0;

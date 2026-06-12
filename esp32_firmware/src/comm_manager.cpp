@@ -167,7 +167,8 @@ void CommManager::update() {
     }
 }
 
-void CommManager::processData(const String& data) {
+void CommManager::processData(const String& data_) {
+    String data = data_;
     data.trim();
     if (data.length() == 0) return;
     

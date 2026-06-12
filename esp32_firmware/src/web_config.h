@@ -5,6 +5,7 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <Update.h>
+#include <esp_ota_ops.h>
 #include "config.h"
 
 // 配网状态
@@ -68,9 +69,11 @@ private:
     void handleReset();
     void handleStatus();
     
-    // OTA固件升级
+    // OTA固件升级（支持回滚）
     void handleOTA();
     void handleOTAUpload();
+    void handleOTARollback();
+    const esp_partition_t* _otaPrevPartition = nullptr;
     
     // 生成配网页面HTML
     String getConfigPageHTML();

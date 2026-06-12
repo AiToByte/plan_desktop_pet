@@ -1,4 +1,5 @@
 #include "wifi_manager.h"
+#include <ESPmDNS.h>
 
 WiFiManager::WiFiManager() : _connected(false), _lastAttempt(0), _configMode(false) {}
 
@@ -68,6 +69,7 @@ bool WiFiManager::connect() {
     if (_webConfig.connectFromSaved()) {
         _connected = true;
         _configMode = false;
+        _startMDNS();
         return true;
     }
     
@@ -78,6 +80,7 @@ bool WiFiManager::connect() {
         if (_webConfig.connectFromSaved()) {
             _connected = true;
             _configMode = false;
+            _startMDNS();
             return true;
         }
     }
@@ -145,4 +148,13 @@ int WiFiManager::getServerPort() {
 void WiFiManager::disconnect() {
     WiFi.disconnect();
     _connected = false;
+}
+
+void WiFiManager::_startMDNS() {
+    if (MDNS.begin("deskpet")) {
+        MDNS.addService("deskpet", "tcp", _webConfig.getConfig().server_port);
+        Serial.println("[WiFi] mDNS started: deskpet.local");
+    } else {
+        Serial.println("[WiFi] mDNS start failed");
+    }
 }

@@ -111,6 +111,10 @@ public:
     DisplayMode getDisplayMode() const { return _displayMode; }
     PixelPlayer* getPixelPlayer() const { return _pixelPlayer; }
 
+    // 离线模式公共接口（由renderTask调用）
+    void drawClock();        // 离线模式：显示实时时钟
+    void drawBlinkAnim();    // 眨眼动画
+
 private:
     LGFX _lcd;
     LGFX_Sprite _sprite;  // 双缓冲：离屏画布，消除闪烁
@@ -131,8 +135,6 @@ private:
     void drawWeatherPanel(const WeatherInfo& weather);
     void drawTokenPanel(const TokenStats& tokens);
     void drawFaceAnimation();
-    void drawClock();        // 离线模式：显示实时时钟
-    void drawBlinkAnim();    // 眨眼动画
 
     // 像素帧绘制
     void drawPixelFrame();

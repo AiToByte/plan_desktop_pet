@@ -57,4 +57,12 @@
 // 调试
 #define DEBUG_SERIAL 1
 
+// 蜂鸣器引脚 (无源蜂鸣器)
+#define BUZZER_PIN 18          // GPIO18
+
+// 电容触摸引脚
+#define TOUCH_PIN 1            // GPIO1 (Touch1)
+#define TOUCH_THRESHOLD 40     // 触摸阈值（需校准）
+#define TOUCH_LONG_PRESS_MS 1000
+
 #endif // CONFIG_H
