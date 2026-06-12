@@ -73,8 +73,20 @@ bool WiFiManager::connect() {
         return true;
     }
     
-    // 保存的配置失败，尝试UDP自动发现PC服务器
-    Serial.println("[WiFi] Saved config failed, trying UDP discovery...");
+    // 保存的配置失败，先尝试mDNS发现PC服务器（最快）
+    Serial.println("[WiFi] Saved config failed, trying mDNS discovery...");
+    if (_tryMDNSDiscovery()) {
+        Serial.println("[WiFi] mDNS discovery OK, retrying connection...");
+        if (_webConfig.connectFromSaved()) {
+            _connected = true;
+            _configMode = false;
+            _startMDNS();
+            return true;
+        }
+    }
+    
+    // mDNS失败，尝试UDP自动发现PC服务器
+    Serial.println("[WiFi] mDNS failed, trying UDP discovery...");
     if (tryUDPDiscovery()) {
         Serial.println("[WiFi] UDP discovery OK, retrying connection...");
         if (_webConfig.connectFromSaved()) {
@@ -148,6 +160,37 @@ int WiFiManager::getServerPort() {
 void WiFiManager::disconnect() {
     WiFi.disconnect();
     _connected = false;
+}
+
+bool WiFiManager::_tryMDNSDiscovery() {
+    Serial.println("[WiFi] mDNS: querying _deskpet._tcp.local. ...");
+    
+    int n = MDNS.queryService("deskpet", "tcp");
+    if (n == 0) {
+        Serial.println("[WiFi] mDNS: no service found");
+        return false;
+    }
+    
+    // 取第一个结果
+    String ip = MDNS.IP(0).toString();
+    int port = MDNS.port(0);
+    
+    if (ip.length() == 0 || port <= 0) {
+        Serial.println("[WiFi] mDNS: invalid result");
+        return false;
+    }
+    
+    Serial.printf("[WiFi] mDNS: found %s:%d\n", ip.c_str(), port);
+    
+    // 保存到Flash（与WebConfig统一命名空间和Key）
+    Preferences prefs;
+    prefs.begin("pet_config", false);
+    prefs.putString("host", ip);
+    prefs.putInt("port", port);
+    prefs.putBool("valid", true);
+    prefs.end();
+    
+    return true;
 }
 
 void WiFiManager::_startMDNS() {

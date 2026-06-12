@@ -17,7 +17,12 @@ DisplayManager::DisplayManager()
     , _currentFace(FACE_OFFLINE)
     , _blinkCounter(0)
     , _displayMode(MODE_NORMAL)
-    , _pixelPlayer(nullptr) {}
+    , _pixelPlayer(nullptr)
+    , _springTemp(0.03f, 0.85f, 0.3f)     // 温度：死区0.3°C
+    , _springTokens(0.04f, 0.80f, 50.0f)  // Token：死区50（大数不抖）
+    , _springCpu(0.05f, 0.82f, 0.5f)      // CPU%：死区0.5%
+    , _springMem(0.03f, 0.85f, 1.0f)      // 内存：死区1MB
+    {}
 
 void DisplayManager::begin() {
     _lcd.init();
@@ -28,6 +33,7 @@ void DisplayManager::begin() {
     // 创建双缓冲离屏画布（与屏幕同尺寸）
     _sprite.deleteSprite();
     _sprite.createSprite(SCREEN_WIDTH, SCREEN_HEIGHT);
+    _transitionSprite.createSprite(SCREEN_WIDTH, SCREEN_HEIGHT);  // 用于淡入淡出alpha混合
     Serial.printf("[Display] Sprite buffer created: %dx%d\n", SCREEN_WIDTH, SCREEN_HEIGHT);
 }
 
@@ -63,6 +69,13 @@ void DisplayManager::showBootScreen(String message) {
 void DisplayManager::update(const DisplayData& data) {
     _currentStatus = data.agent.status;
 
+    // 缓存原始数据 + 更新弹簧目标值
+    _lastData = data;
+    _springTemp.setTarget(data.weather.temperature);
+    _springTokens.setTarget(data.tokens.inputTokens + data.tokens.outputTokens);
+    _springCpu.setTarget(data.agent.cpuPercent);
+    _springMem.setTarget(data.agent.memoryMB);
+
     // 像素模式下跳过正常UI更新
     if (_displayMode == MODE_PIXEL) return;
 
@@ -86,6 +99,12 @@ void DisplayManager::update(const DisplayData& data) {
 }
 
 void DisplayManager::updateAnimation() {
+    // 弹簧物理动画驱动（每200ms一帧）
+    _springTemp.update(200);
+    _springTokens.update(200);
+    _springCpu.update(200);
+    _springMem.update(200);
+
     // 像素模式：播放PXL动画
     if (_displayMode == MODE_PIXEL && _pixelPlayer) {
         if (_pixelPlayer->update()) {
@@ -123,21 +142,32 @@ void DisplayManager::setPixelMode(PixelPlayer* player) {
         Serial.println("[Display] Cannot set pixel mode: player not ready");
         return;
     }
+    // 捕获当前帧作为fade旧帧
+    _transitionSprite.pushSprite(&_sprite, 0, 0);
+    // 切换模式并立即绘制新内容
     _pixelPlayer = player;
     _displayMode = MODE_PIXEL;
-    _sprite.fillScreen(COLOR_BG);
-    _sprite.pushSprite(&_lcd, 0, 0);
-    Serial.println("[Display] Switched to PIXEL mode");
+    drawPixelFrame();
+    // 启动淡入淡出（旧→新）
+    _fadeActive = true;
+    _fadeFrame = 0;
+    _fadeBlend();
+    Serial.println("[Display] Switched to PIXEL mode (fade)");
 }
 
 void DisplayManager::setNormalMode() {
+    // 捕获当前帧作为fade旧帧
+    _transitionSprite.pushSprite(&_sprite, 0, 0);
+    // 切换模式并立即绘制新内容
     _displayMode = MODE_NORMAL;
     _pixelPlayer = nullptr;
-    _sprite.fillScreen(COLOR_BG);
-    _sprite.pushSprite(&_lcd, 0, 0);
-    // 强制下次update重绘完整UI
+    drawNormalFrame();
     _lastAnimTime = 0;
-    Serial.println("[Display] Switched to NORMAL mode");
+    // 启动淡入淡出（旧→新）
+    _fadeActive = true;
+    _fadeFrame = 0;
+    _fadeBlend();
+    Serial.println("[Display] Switched to NORMAL mode (fade)");
 }
 
 void DisplayManager::drawPixelFrame() {
@@ -219,8 +249,8 @@ void DisplayManager::drawStatusBar(const AgentState& agent) {
     // CPU/内存 (右对齐)
     _sprite.setTextDatum(middle_right);
     _sprite.setTextColor(COLOR_TEXT_DIM);
-    _sprite.drawString("CPU:" + String(agent.cpuPercent, 1) + "%", SCREEN_WIDTH - 8, y + 8);
-    _sprite.drawString("MEM:" + String(agent.memoryMB, 0) + "MB", SCREEN_WIDTH - 8, y + 24);
+    _sprite.drawString("CPU:" + String(_springCpu.current(), 1) + "%", SCREEN_WIDTH - 8, y + 8);
+    _sprite.drawString("MEM:" + String(_springMem.current(), 0) + "MB", SCREEN_WIDTH - 8, y + 24);
 }
 
 void DisplayManager::drawWeatherPanel(const WeatherInfo& weather) {
@@ -237,7 +267,7 @@ void DisplayManager::drawWeatherPanel(const WeatherInfo& weather) {
     _sprite.setTextColor(COLOR_TEXT);
     _sprite.setTextSize(2);
     _sprite.setTextDatum(top_left);
-    _sprite.drawString(String(weather.temperature, 1) + "C", 48, y + 10);
+    _sprite.drawString(String(_springTemp.current(), 1) + "C", 48, y + 10);
 
     // 天气描述
     _sprite.setTextSize(1);
@@ -271,7 +301,7 @@ void DisplayManager::drawTokenPanel(const TokenStats& tokens) {
     _sprite.setTextDatum(middle_left);
     _sprite.drawString("Tokens:", 14, y + 14);
     _sprite.setTextColor(FACE_YELLOW);
-    _sprite.drawString(String(tokens.inputTokens + tokens.outputTokens), 70, y + 14);
+    _sprite.drawString(String((int)_springTokens.current()), 70, y + 14);
 
     // 费用
     _sprite.setTextDatum(middle_right);
@@ -875,4 +905,54 @@ void DisplayManager::drawBlinkAnim() {
 
     // 嘴巴
     _sprite.fillCircle(cx, cy + 16, 3, FACE_BLACK);
+}
+
+// ============ 模式切换淡入淡出 ============
+
+void DisplayManager::_fadeBlend() {
+    if (!_fadeActive) return;
+
+    // 旧帧在_transitionSprite，新帧已绘制到_sprite
+    uint8_t* oldBuf = (uint8_t*)_transitionSprite.getBuffer();
+    uint8_t* newBuf = (uint8_t*)_sprite.getBuffer();
+    if (!oldBuf || !newBuf) { _fadeActive = false; return; }
+
+    const int totalPixels = SCREEN_WIDTH * SCREEN_HEIGHT;
+    // 临时缓冲区存放混合结果（从新帧拷贝，然后逐像素修改）
+    uint8_t* blendBuf = (uint8_t*)malloc(totalPixels * 2);
+    if (!blendBuf) { _fadeActive = false; return; }
+
+    while (_fadeActive) {
+        uint32_t t = millis();
+        uint8_t alpha = (_fadeFrame * 255) / FADE_FRAMES;  // 0..240, 16档
+        uint16_t invAlpha = FADE_FRAMES - _fadeFrame;
+
+        // 逐像素混合: result = old*(1-alpha) + new*alpha (用移位代替除法)
+        uint16_t* dst = (uint16_t*)blendBuf;
+        const uint16_t* oldPx = (const uint16_t*)oldBuf;
+        const uint16_t* newPx = (const uint16_t*)newBuf;
+        for (int i = 0; i < totalPixels; i++) {
+            uint16_t o = oldPx[i], n = newPx[i];
+            uint16_t ro = (o >> 11) & 0x1F, go = (o >> 5) & 0x3F, bo = o & 0x1F;
+            uint16_t rn = (n >> 11) & 0x1F, gn = (n >> 5) & 0x3F, bn = n & 0x1F;
+            uint16_t r = (ro * invAlpha + rn * alpha) >> 4;
+            uint16_t g = (go * invAlpha + gn * alpha) >> 4;
+            uint16_t b = (bo * invAlpha + bn * alpha) >> 4;
+            dst[i] = (r << 11) | (g << 5) | b;
+        }
+
+        // 将混合结果拷贝到_sprite并推送
+        memcpy(newBuf, blendBuf, totalPixels * 2);
+        _sprite.pushSprite(&_lcd, 0, 0);
+
+        _fadeFrame++;
+        if (_fadeFrame >= FADE_FRAMES) {
+            _fadeActive = false;
+            break;
+        }
+        // 16ms per frame → 总计 ~256ms
+        uint32_t elapsed = millis() - t;
+        if (elapsed < 16) delay(16 - elapsed);
+    }
+    free(blendBuf);
 }

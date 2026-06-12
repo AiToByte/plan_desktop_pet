@@ -11,6 +11,7 @@
 #include "config.h"
 #include "types.h"
 #include "pixel_player.h"
+#include "spring_animation.h"
 
 // ============ 屏幕驱动配置 ============
 
@@ -128,6 +129,24 @@ private:
     // 像素模式
     DisplayMode _displayMode;
     PixelPlayer* _pixelPlayer;
+
+    // 弹簧物理动画器（数值弹性过渡）
+    SpringAnimator _springTemp;      // 温度
+    SpringAnimator _springTokens;    // Token总数
+    SpringAnimator _springCpu;       // CPU%
+    SpringAnimator _springMem;       // 内存MB
+
+    // 原始数据缓存（供SpringAnimator读取目标值）
+    DisplayData _lastData;
+
+    // 模式切换淡入淡出
+    LGFX_Sprite _transitionSprite;   // 旧帧缓存（用于alpha混合）
+    bool _fadeActive = false;        // 是否正在执行淡入淡出
+    uint8_t _fadeFrame = 0;          // 当前渐变帧 (0..FADE_FRAMES-1)
+    DisplayMode _fadeTargetMode;     // 目标模式
+    PixelPlayer* _fadeTargetPlayer = nullptr;  // 目标像素播放器
+    static constexpr uint8_t FADE_FRAMES = 16; // 渐变帧数
+    void _fadeBlend();               // 执行一帧alpha混合
 
     // 主绘制方法
     void drawHeader();

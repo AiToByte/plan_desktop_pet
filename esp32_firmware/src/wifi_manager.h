@@ -39,6 +39,7 @@ private:
     bool _configMode;
     
     void _startMDNS();
+    bool _tryMDNSDiscovery();
 };
 
 #endif

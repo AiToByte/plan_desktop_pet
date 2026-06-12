@@ -17,13 +17,19 @@
 #include "sound_manager.h"
 #include "touch_handler.h"
 #include <esp_ota_ops.h>
+#include <esp_sleep.h>
+#include "driver/rtc_io.h"
 
 // ============ 共享数据 (mutex保护) ============
 DisplayData g_displayData;
 SemaphoreHandle_t g_dataMutex;
 
 // 像素缓冲区（通信任务写入，渲染任务读取）
-uint8_t* g_pxlBuffer = nullptr;
+// PSRAM静态预分配池：32x32x2x64 = 128KB，避免运行时malloc碎片化
+__attribute__((section(".psram"))) static uint8_t g_pxlPool[32 * 32 * 2 * 64];
+static constexpr size_t PXL_POOL_SIZE = sizeof(g_pxlPool);
+
+uint8_t* g_pxlBuffer = g_pxlPool;
 size_t g_pxlOffset = 0;
 size_t g_pxlCapacity = 0;
 
@@ -41,6 +47,7 @@ TaskHandle_t g_renderTaskHandle = NULL;
 
 // 休眠状态
 unsigned long g_lastDataReceived = 0;  // 最后收到有效数据的时间
+unsigned long g_screenSleepStart = 0;  // 进入屏幕休眠的时间（用于Light Sleep计时）
 bool g_screenDimmed = false;
 bool g_screenSleeping = false;
 bool g_forceWake = false;  // 通信收到数据时强制唤醒
@@ -128,10 +135,8 @@ void commTask(void* pvParameters) {
         // 检查连接状态
         if (!comm.isConnected() && wifi.isConnected()) {
             // 断连时清理像素状态
-            if (g_pxlBuffer) {
-                free(g_pxlBuffer);
-                g_pxlBuffer = nullptr;
-            }
+            // 断连时重置像素池状态（无需free，静态池常驻）
+            g_pxlBuffer = g_pxlPool;
             g_pxlCapacity = 0;
             g_pxlOffset = 0;
             g_pendingNormalMode = true;  // Core 1将执行display.setNormalMode()
@@ -188,6 +193,7 @@ void renderTask(void* pvParameters) {
             display.sleep();
             g_screenSleeping = true;
             g_screenDimmed = true;
+            g_screenSleepStart = now;
             Serial.println("[Render] Screen sleep (timeout), CPU 80MHz, WiFi sleep");
             vTaskDelay(pdMS_TO_TICKS(1000));  // 休眠后降低刷新率
             continue;
@@ -199,7 +205,22 @@ void renderTask(void* pvParameters) {
         }
         
         if (g_screenSleeping) {
-            vTaskDelay(pdMS_TO_TICKS(500));  // 休眠时低频轮询
+            // Light Sleep: 屏幕休眠5分钟后进入ESP32 Light Sleep（超低功耗）
+            static constexpr uint32_t LIGHT_SLEEP_TIMEOUT = 300000;  // 5min
+            if (now - g_screenSleepStart >= LIGHT_SLEEP_TIMEOUT) {
+                Serial.println("[Power] Entering Light Sleep (touch+wifi beacon wakeup)");
+                display.sleep();
+                esp_sleep_enable_touchpad_wakeup();
+                esp_sleep_enable_wifi_beacon_wakeup();
+                esp_light_sleep_start();
+                // === 唤醒 ===
+                setCpuFrequencyMhz(240);
+                g_screenSleeping = false;
+                g_screenDimmed = false;
+                g_forceWake = true;
+                Serial.println("[Power] Woke from Light Sleep, CPU 240MHz");
+            }
+            vTaskDelay(pdMS_TO_TICKS(500));  // 未达Light Sleep阈值时低频轮询
             continue;
         }
         
@@ -233,7 +254,7 @@ void renderTask(void* pvParameters) {
             } else {
                 Serial.println("[Render] Pixel load failed on Core 1");
             }
-            free(buf);
+            // 静态PSRAM池无需free（Core 1加载后数据已复制到PixelPlayer内部）
             g_pendingPixelBufferLoad = false;
         }
         
@@ -255,6 +276,24 @@ void renderTask(void* pvParameters) {
                 display.drawBlinkAnim();
             } else {
                 display.updateAnimation();
+            }
+        }
+        
+        // ===== 温控自适应（每10秒检测，避免CPU过热） =====
+        static unsigned long lastThermalCheck = 0;
+        if (!g_screenSleeping && now - lastThermalCheck >= 10000) {
+            lastThermalCheck = now;
+            float cpuTemp = temperatureRead();
+            if (cpuTemp > 65.0f) {
+                setCpuFrequencyMhz(80);
+                display.setBrightness(80);  // 降低背光减轻发热
+                Serial.printf("[Render] THERMAL CRITICAL %.1f°C → CPU 80MHz + dim\n", cpuTemp);
+            } else if (cpuTemp > 55.0f) {
+                setCpuFrequencyMhz(160);
+                Serial.printf("[Render] THERMAL WARNING %.1f°C → CPU 160MHz\n", cpuTemp);
+            } else if (cpuTemp < 50.0f && getCpuFrequencyMhz() < 240) {
+                setCpuFrequencyMhz(240);
+                Serial.printf("[Render] THERMAL OK %.1f°C → CPU 240MHz\n", cpuTemp);
             }
         }
         
@@ -482,60 +521,74 @@ void parseServerData(String json) {
         }
     }
     else if (type == "pixel_data") {
-        // pixel_data包含二进制Base64，用DynamicJsonDocument无法过滤，保持原分配
-        DynamicJsonDocument doc(1024);
-        DeserializationError error = deserializeJson(doc, json);
-        if (error) { Serial.printf("[JSON] pixel_data parse error: %s\n", error.c_str()); return; }
-        
-        String pxlBase64 = doc["data"] | "";
-        int chunkIndex = doc["chunk"] | 0;
-        bool isLastChunk = doc["last"] | false;
+        // 流式解析：用小StaticJsonDocument仅解析chunk/last，手动提取base64指针避免大buffer拷贝
+        // 检查数据完整性
+        const char* dataField = strstr(json.c_str(), "\"data\":\"");
+        const char* chunkField = strstr(json.c_str(), "\"chunk\":");
+        const char* lastField = strstr(json.c_str(), "\"last\":");
+        if (!dataField || !chunkField) { Serial.println("[Main] Pixel: missing data/chunk field"); return; }
+
+        // 小JSON文档只解析chunk和last（两个整数字段，极小内存）
+        StaticJsonDocument<256> metaDoc;
+        // 截取chunk/last部分：找到"data"字段起始，用其位置作为JSON结束
+        const char* dataKey = strstr(json.c_str(), "\"data\"");
+        if (!dataKey) return;
+        // 在"data"键之前截断，仅解析chunk和last
+        size_t prefixLen = dataKey - json.c_str();
+        char prefixBuf[prefixLen + 1];
+        memcpy(prefixBuf, json.c_str(), prefixLen);
+        prefixBuf[prefixLen] = '\0';
+        DeserializationError error = deserializeJson(metaDoc, prefixBuf);
+        if (error) { Serial.printf("[Main] Pixel meta parse error: %s\n", error.c_str()); return; }
+
+        int chunkIndex = metaDoc["chunk"] | 0;
+        bool isLastChunk = metaDoc["last"] | false;
+
+        // 手动提取base64数据指针（避免拷贝到String/JsonDocument）
+        const char* dataStart = dataField + 8; // 跳过 "data":"
+        const char* dataEnd = strchr(dataStart, '"');
+        if (!dataEnd) { Serial.println("[Main] Pixel: malformed data field"); return; }
+        size_t b64Len = dataEnd - dataStart;
 
         if (chunkIndex == 0) {
-            if (g_pxlBuffer) { free(g_pxlBuffer); g_pxlBuffer = nullptr; }
-            g_pxlCapacity = 4096;
-            g_pxlBuffer = (uint8_t*)ps_malloc(g_pxlCapacity);
+            g_pxlBuffer = g_pxlPool;
+            g_pxlCapacity = PXL_POOL_SIZE;
             g_pxlOffset = 0;
         }
+        if (!g_pxlBuffer) { Serial.println("[Main] Pixel: buffer alloc failed"); return; }
 
-        if (!g_pxlBuffer) {
-            Serial.println("[Main] Pixel: buffer alloc failed");
+        // 预估解码后大小（base64: 每4字节→3字节二进制）
+        size_t estimatedDecoded = b64Len * 3 / 4;
+        if (g_pxlOffset + estimatedDecoded > g_pxlCapacity) {
+            Serial.printf("[Main] Pixel: overflow! offset=%d est_decoded=%d cap=%d\n",
+                          g_pxlOffset, estimatedDecoded, (int)g_pxlCapacity);
             return;
         }
 
-        size_t decodedLen = pxlBase64.length() * 3 / 4 + 3;
-        while (g_pxlOffset + decodedLen > g_pxlCapacity) {
-            g_pxlCapacity *= 2;
-            uint8_t* newBuf = (uint8_t*)ps_realloc(g_pxlBuffer, g_pxlCapacity);
-            if (!newBuf) {
-                Serial.println("[Main] Pixel: realloc failed");
-                free(g_pxlBuffer); g_pxlBuffer = nullptr;
-                return;
-            }
-            g_pxlBuffer = newBuf;
-        }
-
-        // 使用mbedtls进行base64解码（ESP32 Arduino内置）
+        // 直接解码到PSRAM池（mbedtls自报告实际写入字节数）
         size_t written = 0;
-        mbedtls_base64_decode(g_pxlBuffer + g_pxlOffset,
-                              (size_t)(g_pxlCapacity - g_pxlOffset),
-                              &written,
-                              (const unsigned char*)pxlBase64.c_str(),
-                              pxlBase64.length());
+        int ret = mbedtls_base64_decode(g_pxlBuffer + g_pxlOffset,
+                                        g_pxlCapacity - g_pxlOffset,
+                                        &written,
+                                        (const unsigned char*)dataStart,
+                                        b64Len);
+        if (ret != 0) {
+            Serial.printf("[Main] Pixel: base64 decode error %d (chunk %d)\n", ret, chunkIndex);
+            return;
+        }
         g_pxlOffset += written;
         Serial.printf("[Main] Pixel chunk %d decoded: %d bytes, total %d\n", chunkIndex, written, g_pxlOffset);
 
         if (isLastChunk && g_pxlBuffer) {
-            // 不在 Core 0 直接 loadFromBuffer —— Core 1 渲染循环可能正在访问 pixelPlayer
-            // 将缓冲区指针传递给 Core 1，由它在自己的时间片内加载，加载后释放
-            g_pendingPixelBufferPtr = g_pxlBuffer;
+            // 将缓冲区指针传递给 Core 1，由它在自己的时间片内加载
+            g_pendingPixelBufferPtr = g_pxlPool;
             g_pendingPixelSize = g_pxlOffset;
             g_pendingPixelBufferLoad.store(true);
-            Serial.printf("[Main] Pixel buffer ready (%d bytes), pending load on Core 1\n", g_pxlOffset);
-            // 不释放 g_pxlBuffer —— Core 1 load 完成后负责 free
-            g_pxlBuffer = nullptr;
+            Serial.printf("[Main] Pixel pool ready (%d bytes), pending load on Core 1\n", g_pxlOffset);
+            // 重置池指针（Core 1加载后数据已复制到PixelPlayer内部）
+            g_pxlBuffer = g_pxlPool;
             g_pxlOffset = 0;
-            g_pxlCapacity = 0;
+            g_pxlCapacity = PXL_POOL_SIZE;
         }
     }
     else if (type == "pixel_cmd") {
