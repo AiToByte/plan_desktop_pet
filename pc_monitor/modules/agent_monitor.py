@@ -40,7 +40,7 @@ class AgentMonitor:
         self.check_interval = config.get("check_interval", 2)
         self._running = False
         self._current_state = None
-        self._last_cpu_time = 0
+        self._cached_proc = None  # 缓存进程对象，避免cpu_percent永远返回0
         self._cpu_history = []
         self._idle_streak = 0
         
@@ -58,12 +58,6 @@ class AgentMonitor:
                 continue
         return None
     
-    def __init_cpu(self):
-        """初始化非阻塞CPU采样（首次调用需预热）"""
-        self._last_cpu_time = 0
-        self._cpu_history = []  # 最近N次CPU采样
-        self._idle_streak = 0   # 连续低CPU计数
-
     def _analyze_cpu_pattern(self, proc: psutil.Process) -> AgentStatus:
         """通过CPU使用模式判断Agent状态（非阻塞）"""
         try:
@@ -97,7 +91,24 @@ class AgentMonitor:
     
     def get_state(self) -> AgentState:
         """获取当前Agent状态"""
-        proc = self._find_agent_process()
+        # 1. 验证缓存的进程是否依然存活
+        if self._cached_proc:
+            try:
+                if not self._cached_proc.is_running():
+                    self._cached_proc = None
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                self._cached_proc = None
+
+        # 2. 如果无缓存，则重新查找
+        if self._cached_proc is None:
+            self._cached_proc = self._find_agent_process()
+            self._cpu_history = []
+            self._idle_streak = 0
+            if self._cached_proc:
+                # 预热首次采样（丢弃结果）
+                self._cached_proc.cpu_percent(interval=None)
+
+        proc = self._cached_proc
         
         if proc is None:
             return AgentState(
@@ -112,7 +123,7 @@ class AgentMonitor:
         
         try:
             with proc.oneshot():
-                cpu_percent = proc.cpu_percent()
+                cpu_percent = proc.cpu_percent(interval=0)
                 memory_info = proc.memory_info()
                 create_time = proc.create_time()
                 
@@ -130,6 +141,7 @@ class AgentMonitor:
             
         except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
             logger.warning(f"获取进程信息失败: {e}")
+            self._cached_proc = None  # 进程异常，清除缓存
             return AgentState(
                 status=AgentStatus.OFFLINE,
                 process_name="unknown",

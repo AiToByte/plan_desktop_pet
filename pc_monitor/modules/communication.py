@@ -88,18 +88,18 @@ class SerialCommunication(CommunicationBase):
         logger.info("串口已断开")
     
     def send_message(self, msg: DeviceMessage) -> bool:
-        """发送消息"""
+        """发送消息（带长度前缀帧）"""
         if not self._connected or not self._serial:
             return False
         
         try:
-            data = json.dumps({
+            payload = json.dumps({
                 "type": msg.msg_type,
                 "data": msg.data,
                 "ts": msg.timestamp
-            }) + "\n"
-            
-            self._serial.write(data.encode('utf-8'))
+            })
+            frame = f"LEN:{len(payload)}\n{payload}\n"
+            self._serial.write(frame.encode('utf-8'))
             return True
             
         except Exception as e:
@@ -107,16 +107,36 @@ class SerialCommunication(CommunicationBase):
             return False
     
     def _read_loop(self):
-        """读取数据循环"""
+        """读取数据循环（支持长度前缀帧 + 旧格式fallback）"""
         buffer = ""
+        expected_len = None
+        payload_buf = ""
+        
         while self._running and self._connected:
             try:
                 if self._serial and self._serial.in_waiting:
                     char = self._serial.read().decode('utf-8', errors='ignore')
                     if char == '\n':
-                        if buffer:
-                            self._process_received(buffer.strip())
-                            buffer = ""
+                        line = buffer
+                        buffer = ""
+                        
+                        if expected_len is not None:
+                            # 正在读取帧payload
+                            payload_buf += line
+                            if len(payload_buf) >= expected_len:
+                                self._process_received(payload_buf[:expected_len])
+                                expected_len = None
+                                payload_buf = ""
+                        elif line.startswith("LEN:"):
+                            # 新帧协议: LEN:NNNN
+                            try:
+                                expected_len = int(line[4:])
+                                payload_buf = ""
+                            except ValueError:
+                                logger.warning(f"Invalid LEN line: {line}")
+                        elif line:
+                            # 旧格式fallback: 纯JSON行
+                            self._process_received(line.strip())
                     else:
                         buffer += char
                 else:
@@ -240,19 +260,19 @@ class WiFiCommunication(CommunicationBase):
         logger.info("TCP Server 已关闭")
     
     def send_message(self, msg: DeviceMessage) -> bool:
-        """发送消息到已连接的ESP32"""
+        """发送消息到已连接的ESP32（带长度前缀帧）"""
         with self._lock:
             if not self._client_socket:
                 return False
             
             try:
-                data = json.dumps({
+                payload = json.dumps({
                     "type": msg.msg_type,
                     "data": msg.data,
                     "ts": msg.timestamp
-                }) + "\n"
-                
-                self._client_socket.sendall(data.encode('utf-8'))
+                })
+                frame = f"LEN:{len(payload)}\n{payload}\n"
+                self._client_socket.sendall(frame.encode('utf-8'))
                 return True
                 
             except Exception as e:
@@ -263,8 +283,11 @@ class WiFiCommunication(CommunicationBase):
                 return False
     
     def _read_loop(self):
-        """读取客户端数据循环"""
+        """读取客户端数据循环（支持长度前缀帧 + 旧格式fallback）"""
         buffer = ""
+        expected_len = None
+        payload_buf = ""
+        
         while self._running:
             with self._lock:
                 client = self._client_socket
@@ -272,7 +295,7 @@ class WiFiCommunication(CommunicationBase):
                 break
             
             try:
-                data = client.recv(1024).decode('utf-8')
+                data = client.recv(4096).decode('utf-8')
                 if not data:
                     logger.info("ESP32 连接已断开")
                     with self._lock:
@@ -284,7 +307,20 @@ class WiFiCommunication(CommunicationBase):
                 buffer += data
                 while '\n' in buffer:
                     line, buffer = buffer.split('\n', 1)
-                    if line.strip():
+                    
+                    if expected_len is not None:
+                        payload_buf += line
+                        if len(payload_buf) >= expected_len:
+                            self._process_received(payload_buf[:expected_len])
+                            expected_len = None
+                            payload_buf = ""
+                    elif line.startswith("LEN:"):
+                        try:
+                            expected_len = int(line[4:])
+                            payload_buf = ""
+                        except ValueError:
+                            logger.warning(f"Invalid LEN line: {line}")
+                    elif line.strip():
                         self._process_received(line.strip())
                         
             except socket.timeout:

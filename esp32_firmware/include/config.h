@@ -35,6 +35,16 @@
 #define UPDATE_INTERVAL 1000
 #define ANIMATION_INTERVAL 500
 
+// FreeRTOS双核配置
+#define COMM_TASK_CORE    0    // 通信任务运行在Core 0
+#define RENDER_TASK_CORE  1    // 渲染任务运行在Core 1
+#define COMM_TASK_STACK   8192 // 通信任务栈大小
+#define RENDER_TASK_STACK 16384 // 渲染任务栈较大(含sprite操作)
+
+// 屏幕休眠配置
+#define SCREEN_DIM_TIMEOUT   30000  // 30秒无数据→变暗
+#define SCREEN_SLEEP_TIMEOUT 60000  // 60秒无数据→休眠(关背光)
+
 // 状态定义
 #define STATUS_IDLE      0
 #define STATUS_WORKING   1

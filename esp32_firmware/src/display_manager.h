@@ -30,6 +30,7 @@ public:
         cfg.pin_mosi = LCD_MOSI;
         cfg.pin_miso = LCD_MISO;
         cfg.pin_dc = LCD_DC;
+        cfg.dma_channel = SPI_DMA_CH_AUTO;  // 启用DMA异步传输
         _bus.config(cfg);
         _panel.setBus(&_bus);
 
@@ -97,6 +98,11 @@ public:
     void update(const DisplayData& data);
     void updateAnimation();
     void showBootScreen(String message);
+
+    // 屏幕休眠控制
+    void dim();      // 降低亮度（数据超时）
+    void sleep();    // 关闭背光（深度休眠）
+    void wakeup();   // 恢复全亮
 
     // 像素模式控制
     void setPixelMode(PixelPlayer* player);   // 进入自定义像素模式

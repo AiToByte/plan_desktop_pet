@@ -1,13 +1,19 @@
 #include "comm_manager.h"
 
-CommManager::CommManager() : _connected(false), _hasNewData(false), _lastReconnect(0) {
+CommManager::CommManager() 
+    : _connected(false), _hasNewData(false), _lastReconnect(0)
+    , _lastReceiveTime(0), _frameState(FRAME_IDLE)
+    , _expectedLen(0) {
     _serverHost = "";
     _serverPort = SERVER_PORT;
 }
 
 void CommManager::begin() {
-    _buffer = "";
     _lastData = "";
+    _lenBuffer = "";
+    _frameBuffer = "";
+    _frameState = FRAME_IDLE;
+    _expectedLen = 0;
 }
 
 void CommManager::setServer(String host, int port) {
@@ -33,16 +39,17 @@ bool CommManager::connect() {
     if (_client.connect(_serverHost.c_str(), _serverPort)) {
         Serial.println("[Comm] Connected!");
         _connected = true;
+        _frameState = FRAME_IDLE;
         
-        // 发送握手消息
+        // 发送握手消息（使用帧协议）
         DynamicJsonDocument doc(256);
         doc["type"] = "handshake";
         doc["device"] = "esp32s3";
-        doc["version"] = "1.0.0";
+        doc["version"] = "2.0.0";  // v2: 长度前缀帧协议
         
         String json;
         serializeJson(doc, json);
-        _client.println(json);
+        sendFramed(json);
         
         return true;
     }
@@ -55,6 +62,9 @@ bool CommManager::connect() {
 void CommManager::disconnect() {
     _client.stop();
     _connected = false;
+    _frameState = FRAME_IDLE;
+    _lenBuffer = "";
+    _frameBuffer = "";
 }
 
 void CommManager::reconnect() {
@@ -74,11 +84,79 @@ void CommManager::update() {
     
     while (_client.available()) {
         char c = _client.read();
-        if (c == '\n') {
-            processData(_buffer);
-            _buffer = "";
-        } else {
-            _buffer += c;
+        
+        switch (_frameState) {
+            case FRAME_IDLE:
+                // 检测帧类型：'L' = 长度前缀, '{' = 旧格式JSON
+                if (c == 'L') {
+                    _lenBuffer = "L";
+                    _frameState = FRAME_READ_LEN;
+                } else if (c == '{') {
+                    // 旧格式fallback：整行是一个JSON
+                    _frameBuffer = "{";
+                    _frameState = FRAME_LEGACY_LINE;
+                }
+                // 其他字符（空白等）跳过
+                break;
+                
+            case FRAME_READ_LEN:
+                // 累积到换行符：期望格式 "EN:NNNN\n"
+                if (c == '\n') {
+                    // 解析 "LEN:NNNN" → "L" + "EN:NNNN"
+                    // _lenBuffer = "LEN:NNNN"
+                    if (_lenBuffer.startsWith("LEN:")) {
+                        _expectedLen = atoi(_lenBuffer.substring(4).c_str());
+                        if (_expectedLen > 0 && _expectedLen < 256 * 1024) {
+                            _frameBuffer = "";
+                            _frameBuffer.reserve(_expectedLen);
+                            _frameState = FRAME_READ_BODY;
+                            Serial.printf("[Comm] Frame len=%d\n", _expectedLen);
+                        } else {
+                            Serial.printf("[Comm] Invalid len: %s\n", _lenBuffer.c_str());
+                            _frameState = FRAME_IDLE;
+                        }
+                    } else {
+                        Serial.printf("[Comm] Bad header: %s\n", _lenBuffer.c_str());
+                        _frameState = FRAME_IDLE;
+                    }
+                    _lenBuffer = "";
+                } else {
+                    _lenBuffer += c;
+                    // 防止超长header攻击
+                    if (_lenBuffer.length() > 16) {
+                        Serial.println("[Comm] Header overflow, reset");
+                        _lenBuffer = "";
+                        _frameState = FRAME_IDLE;
+                    }
+                }
+                break;
+                
+            case FRAME_READ_BODY:
+                _frameBuffer += c;
+                if ((int)_frameBuffer.length() >= _expectedLen) {
+                    // 完整帧到达
+                    processData(_frameBuffer);
+                    _frameBuffer = "";
+                    _expectedLen = 0;
+                    _frameState = FRAME_IDLE;
+                }
+                break;
+                
+            case FRAME_LEGACY_LINE:
+                if (c == '\n') {
+                    processData(_frameBuffer);
+                    _frameBuffer = "";
+                    _frameState = FRAME_IDLE;
+                } else {
+                    _frameBuffer += c;
+                    // 防止单帧过大（旧格式无长度保护）
+                    if (_frameBuffer.length() > 32 * 1024) {
+                        Serial.println("[Comm] Legacy frame overflow, reset");
+                        _frameBuffer = "";
+                        _frameState = FRAME_IDLE;
+                    }
+                }
+                break;
         }
     }
     
@@ -95,6 +173,7 @@ void CommManager::processData(String data) {
     
     _lastData = data;
     _hasNewData = true;
+    _lastReceiveTime = millis();
     
     Serial.print("[Comm] Received: ");
     Serial.println(data.substring(0, 50) + "...");
@@ -114,6 +193,13 @@ String CommManager::getData() {
     return _lastData;
 }
 
+void CommManager::sendFramed(const String& json) {
+    // 帧格式: "LEN:<length>\n<payload>"
+    String header = "LEN:" + String(json.length()) + "\n";
+    _client.print(header);
+    _client.print(json);
+}
+
 void CommManager::sendHeartbeat() {
     DynamicJsonDocument doc(128);
     doc["type"] = "heartbeat";
@@ -121,7 +207,7 @@ void CommManager::sendHeartbeat() {
     
     String json;
     serializeJson(doc, json);
-    _client.println(json);
+    sendFramed(json);
 }
 
 void CommManager::sendMessage(String type, JsonObject data) {
@@ -132,5 +218,5 @@ void CommManager::sendMessage(String type, JsonObject data) {
     
     String json;
     serializeJson(doc, json);
-    _client.println(json);
+    sendFramed(json);
 }

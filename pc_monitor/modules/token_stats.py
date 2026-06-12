@@ -1,13 +1,14 @@
 """
 Token使用统计模块
 解析日志文件，统计AI Agent的Token消耗
+v2: LogTailer增量读取，避免全量扫描IO浪费
 """
 import os
 import re
 import time
 import json
 import logging
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -26,6 +27,62 @@ class TokenStats:
     timestamp: float
 
 
+class LogTailer:
+    """增量日志读取器
+    跟踪每个文件的读取位置，仅读取新增内容。
+    支持文件轮转检测（inode变化或文件缩小）。
+    """
+    
+    def __init__(self):
+        # {file_path: {"position": int, "inode": int}}
+        self._file_states: Dict[str, Dict] = {}
+    
+    def read_new_lines(self, file_path: str) -> List[str]:
+        """读取文件新增行，跳过已读部分"""
+        if not os.path.exists(file_path):
+            return []
+        
+        stat = os.stat(file_path)
+        current_size = stat.st_size
+        # Windows无inode，用文件大小+修改时间模拟
+        current_inode = int(stat.st_mtime * 1000)
+        
+        state = self._file_states.get(file_path)
+        
+        if state is None:
+            # 首次读取：从末尾前10KB开始（避免冷启动全量扫描过久）
+            start_pos = max(0, current_size - 10 * 1024)
+            state = {"position": start_pos, "inode": current_inode}
+            self._file_states[file_path] = state
+        elif current_inode != state["inode"]:
+            # 文件已轮转（inode变化），从头开始
+            logger.info(f"文件轮转检测: {file_path}")
+            state["position"] = 0
+            state["inode"] = current_inode
+        elif current_size < state["position"]:
+            # 文件被截断
+            logger.info(f"文件截断检测: {file_path}")
+            state["position"] = 0
+        
+        if current_size <= state["position"]:
+            return []
+        
+        lines = []
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                f.seek(state["position"])
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        lines.append(line)
+                state["position"] = f.tell()
+            state["inode"] = current_inode
+        except Exception as e:
+            logger.warning(f"增量读取失败 {file_path}: {e}")
+        
+        return lines
+
+
 class TokenTracker:
     """Token使用追踪器"""
     
@@ -41,6 +98,11 @@ class TokenTracker:
         self.log_paths = config.get("log_paths", [])
         self.update_interval = config.get("update_interval", 30)
         self._stats_history = []
+        self._cached_stats = None
+        self._last_scan_time = 0
+        self._tailer = LogTailer()
+        # 累积的token记录（增量追加，不重复扫描）
+        self._accumulated_records: List[Dict] = []
         self._load_cache()
         
     def _load_cache(self):
@@ -83,8 +145,8 @@ class TokenTracker:
         return None
     
     def _scan_log_files(self) -> list:
-        """扫描日志文件，收集Token记录"""
-        records = []
+        """增量扫描日志文件，仅读取新增内容（v2: LogTailer）"""
+        now = time.time()
         
         for log_path in self.log_paths:
             if not os.path.exists(log_path):
@@ -100,20 +162,17 @@ class TokenTracker:
                 ]
             
             for file_path in files:
-                try:
-                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        for line in f:
-                            tokens = self._parse_log_line(line)
-                            if tokens:
-                                tokens["timestamp"] = os.path.getmtime(file_path)
-                                records.append(tokens)
-                except Exception as e:
-                    logger.warning(f"读取文件失败 {file_path}: {e}")
+                new_lines = self._tailer.read_new_lines(file_path)
+                for line in new_lines:
+                    tokens = self._parse_log_line(line)
+                    if tokens:
+                        tokens["timestamp"] = now
+                        self._accumulated_records.append(tokens)
         
-        return records
+        return self._accumulated_records
     
     def get_stats(self) -> TokenStats:
-        """获取Token统计（带缓存，避免频繁全量扫描）"""
+        """获取Token统计（增量更新，避免全量IO扫描）"""
         now = time.time()
         # 10秒内返回缓存
         if (self._cached_stats and 
@@ -121,9 +180,9 @@ class TokenTracker:
             self._last_scan_time > 0):
             return self._cached_stats
 
-        records = self._scan_log_files()
+        self._scan_log_files()
         self._last_scan_time = now
-        now = time.time()
+        records = self._accumulated_records
         
         total_input = sum(r["input_tokens"] for r in records)
         total_output = sum(r["output_tokens"] for r in records)

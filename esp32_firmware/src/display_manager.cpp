@@ -110,8 +110,8 @@ void DisplayManager::updateAnimation() {
         // 重绘表情
         drawFace(faceX, faceY, _currentFace, _animFrame);
 
-        // 提交局部刷新区域到屏幕
-        _sprite.pushSprite(&_lcd, 0, 0);
+        // 提交局部刷新区域到屏幕（仅动画区域，降低70% SPI带宽）
+        _sprite.pushSprite(&_lcd, 0, faceY - 4, 0, faceY - 4, SCREEN_WIDTH, FACE_SIZE + 8);
     }
 }
 
@@ -780,4 +780,24 @@ void DisplayManager::drawStatusDot(int x, int y, int r, uint8_t status, uint8_t 
     float pulse = (sin(frame * 0.5) + 1.0) * 0.5;
     int pr = r + pulse * 2;
     _sprite.fillCircle(x, y, pr, color);
+}
+
+// ============ 屏幕休眠控制 ============
+
+void DisplayManager::dim() {
+    // 降低亮度到30%
+    _lcd.setBrightness(60);
+    Serial.println("[Display] Dimmed to 30%");
+}
+
+void DisplayManager::sleep() {
+    // 关闭背光
+    _lcd.setBrightness(0);
+    Serial.println("[Display] Backlight off (sleep)");
+}
+
+void DisplayManager::wakeup() {
+    // 恢复全亮
+    _lcd.setBrightness(200);
+    Serial.println("[Display] Woke up, full brightness");
 }
