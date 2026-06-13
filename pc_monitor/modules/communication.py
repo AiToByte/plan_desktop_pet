@@ -35,6 +35,8 @@ MDNS_HOSTNAME = "deskpet.local"
 KEEPALIVE_INTERVAL = 10    # 每10秒发送ping
 KEEPALIVE_TIMEOUT = 30     # 30秒无pong视为断连
 SEND_QUEUE_MAXSIZE = 64    # 异步发送队列最大容量
+# [Phase 2] 崩溃遥测配置
+CRASH_REPORT_COOLDOWN = 60  # 崩溃报告冷却时间(秒)，防刷屏
 
 
 logger = logging.getLogger(__name__)
@@ -533,6 +535,17 @@ class WiFiCommunication(CommunicationBase):
                 self._last_pong_time = time.time()
                 self._ping_pending = False
                 return  # pong不传递给上层回调
+            
+            # [Phase 2] 崩溃遥测：记录并转发crash_report
+            if msg_type == "crash_report":
+                crash_data = msg_data.get("data", {})
+                logger.critical(
+                    f"[Crash] ESP32报告崩溃! "
+                    f"reason={crash_data.get('reason', '?')}, "
+                    f"count={crash_data.get('count', '?')}, "
+                    f"stack={crash_data.get('stack', 'N/A')[:200]}"
+                )
+                # 仍传递给上层回调，让tray_app显示崩溃计数
             
             msg = DeviceMessage(
                 msg_type=msg_type,

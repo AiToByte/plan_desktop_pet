@@ -157,6 +157,22 @@ void commTask(void* pvParameters) {
                 comm.sendHeartbeat();
             }
         }
+
+        // [Phase 2] 崩溃遥测：首次连接后发送crash_report
+        static bool crashReported = false;
+        extern uint32_t s_crashCount;  // setup()中统计的崩溃次数
+        if (!crashReported && s_crashCount > 0 && comm.isConnected()) {
+            StaticJsonDocument<512> crashMsg;
+            crashMsg["type"] = "crash_report";
+            crashMsg["data"]["count"] = s_crashCount;
+            crashMsg["data"]["reason"] = (int)esp_reset_reason();
+            crashMsg["ts"] = millis();
+            String crashJson;
+            serializeJson(crashMsg, crashJson);
+            comm.sendFramed(crashJson);
+            Serial.printf("[CRASH] Telemetry sent: count=%u, reason=%d\n", s_crashCount, (int)esp_reset_reason());
+            crashReported = true;
+        }
         
         vTaskDelay(pdMS_TO_TICKS(10));  // 让出CPU，避免看门狗超时
     }
@@ -323,6 +339,8 @@ void renderTask(void* pvParameters) {
             } else {
                 display.update(localData);
             }
+            // [Phase 3] 夜览色温（基于NTP时间自动应用）
+            display.applyNightFilter();
         }
         
         // ===== 动画更新 =====
@@ -397,6 +415,22 @@ void renderTask(void* pvParameters) {
         // 触摸检测
         touch.update();
         
+        // [Phase 1] 接近感应：自动唤醒屏幕
+        if (!g_screenSleeping) {
+            touch.proximity.update();
+        }
+        if (touch.proximity.isNear() || touch.isProximityWakeActive()) {
+            if (g_screenSleeping || g_screenDimmed) {
+                g_forceWake = true;
+                display.setBrightness(LCD_BRIGHTNESS);
+                g_screenSleeping = false;
+                g_screenDimmed = false;
+                g_screenSleepStart = 0;
+                Serial.println("[Proximity] Screen wake triggered");
+            }
+            g_lastDataReceived = now;  // 重置休眠计时
+        }
+        
         vTaskDelay(pdMS_TO_TICKS(frameDelay));
     }
 }
@@ -405,6 +439,20 @@ void renderTask(void* pvParameters) {
 void setup() {
     Serial.begin(115200);
     delay(1000);
+    
+    // [Phase 2] 崩溃遥测：检查reset reason
+    esp_reset_reason_t resetReason = esp_reset_reason();
+    Serial.printf("[INIT] Reset reason: %d\n", resetReason);
+    static uint32_t s_crashCount = 0;
+    if (resetReason == ESP_RST_PANIC || resetReason == ESP_RST_TASK_WDT || 
+        resetReason == ESP_RST_INT_WDT) {
+        s_crashCount++;
+        Serial.printf("[CRASH] Panic detected! Count: %u\n", s_crashCount);
+        // 注册shutdown handler标记崩溃签名
+        esp_register_shutdown_handler([]() {
+            Serial.println("[CRASH] Shutdown handler: preparing telemetry...");
+        });
+    }
     
     Serial.println("================================");
     Serial.println("桌面电子宠物 - ESP32-S3 (v2 Dual-Core)");
@@ -431,6 +479,7 @@ void setup() {
     // 初始化触摸
     Serial.println("[INIT] 初始化触摸...");
     touch.begin();
+    touch.proximity.begin();  // [Phase 1] 接近感应初始化（校准基线）
     touch.setCallback([](TouchEvent e) {
         if (e == TOUCH_SINGLE_TAP) {
             sound.playNotification();
@@ -441,6 +490,8 @@ void setup() {
         } else if (e == TOUCH_LONG_PRESS) {
             sound.playAlert();
             Serial.println("[Touch] Long press");
+        } else if (e == TOUCH_PROXIMITY) {
+            Serial.println("[Touch] Proximity detected");
         }
     });
     

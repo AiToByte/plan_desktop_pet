@@ -79,4 +79,12 @@
 #define TOUCH_THRESHOLD 40     // 触摸阈值（需校准）
 #define TOUCH_LONG_PRESS_MS 1000
 
+// 接近感应配置（基于电容微量差分检测）
+#define PROX_EMA_FAST_ALPHA     0.3f    // 快速EMA系数（响应快）
+#define PROX_EMA_SLOW_ALPHA     0.05f   // 慢速EMA系数（基线跟踪）
+#define PROX_RISING_THRESHOLD   8       // 上升差分阈值（接近检测）
+#define PROX_FALLING_THRESHOLD  4       // 下降差分阈值（远离检测）
+#define PROX_COOLDOWN_MS        2000    // 接近事件冷却时间（防抖）
+#define PROX_WAKE_DURATION_MS   15000   // 接近唤醒后亮屏时长
+
 #endif // CONFIG_H

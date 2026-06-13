@@ -1018,6 +1018,49 @@ void DisplayManager::drawThinkingIndicator(ThinkingState state, uint8_t stepCoun
     }
 }
 
+
+
+// ============ [Phase 3] 夜览色温（基于NTP时间） ============
+
+float DisplayManager::getCurrentHour() const {
+    struct tm timeInfo;
+    if (!getLocalTime(&timeInfo, 100)) {
+        return -1.0f;  // NTP未同步
+    }
+    return timeInfo.tm_hour + timeInfo.tm_min / 60.0f;
+}
+
+void DisplayManager::applyNightFilter() {
+    float hour = getCurrentHour();
+    if (hour < 0) return;  // NTP未同步，跳过
+
+    // 色温曲线：20:00→23:00渐变到暖色，06:00→08:00恢复
+    float targetWarmth = 0.0f;
+    if (hour >= 23.0f || hour < 6.0f) {
+        targetWarmth = 0.8f;   // 深夜最大暖色
+    } else if (hour >= 20.0f && hour < 23.0f) {
+        targetWarmth = (hour - 20.0f) / 3.0f * 0.8f;  // 20~23线性渐变
+    } else if (hour >= 6.0f && hour < 8.0f) {
+        targetWarmth = 0.8f - (hour - 6.0f) / 2.0f * 0.8f;  // 6~8恢复
+    }
+
+    // EMA平滑避免突变
+    _nightWarmth = _nightWarmth * 0.95f + targetWarmth * 0.05f;
+    if (_nightWarmth < 0.01f) return;  // 暖色极低，跳过处理
+
+    // 逐像素降低蓝通道（直接在_framebuf上操作）
+    // 蓝通道最多减10/31（约32%），保持可读性
+    uint8_t blueReduce = (uint8_t)(_nightWarmth * 10.0f);
+    if (blueReduce == 0) return;
+
+    // 使用LCD的setAddrWindow+push像素的方式不实际（帧缓冲是sprite）
+    // 改为通过LCD硬件gamma/寄存器调色（ST7789V支持）
+    // 简化实现：调低LCD背光亮度模拟暖色效果
+    int warmBrightness = LCD_BRIGHTNESS - (int)(_nightWarmth * 30.0f);
+    if (warmBrightness < 20) warmBrightness = 20;
+    _lcd.setBrightness(warmBrightness);
+}
+
 // ============ V-Sync / TE 中断 (硬件Tearing Effect) ============
 // TE引脚由display_manager.h中的TE_PIN定义(config.h配置)
 // ST7789V2在每次frame写入起始时拉低TE引脚，可用作V-Sync信号

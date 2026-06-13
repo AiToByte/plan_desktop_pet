@@ -116,6 +116,10 @@ public:
     void drawClock();        // 离线模式：显示实时时钟
     void drawBlinkAnim();    // 眨眼动画
 
+    // 夜览色温
+    void applyNightFilter();       // 在update()末尾调用，按NTP时间自动调色温
+    float getCurrentHour() const;  // 返回当前小时（0.0~24.0）
+
 private:
     LGFX _lcd;
     LGFX_Sprite _sprite;  // 双缓冲：离屏画布，消除闪烁
@@ -138,6 +142,9 @@ private:
 
     // 原始数据缓存（供SpringAnimator读取目标值）
     DisplayData _lastData;
+
+    // 夜览色温（0.0=正常，1.0=最大暖色）
+    float _nightWarmth = 0.0f;
 
     // 模式切换淡入淡出
     LGFX_Sprite _transitionSprite;   // 旧帧缓存（用于alpha混合）
