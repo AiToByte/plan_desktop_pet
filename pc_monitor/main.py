@@ -8,7 +8,9 @@ import json
 import time
 import signal
 import logging
+import threading
 from pathlib import Path
+from typing import Dict, Any, Optional, Callable
 
 # 添加模块路径
 sys.path.insert(0, str(Path(__file__).parent))
@@ -29,12 +31,29 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+# --- 常量 (main) ---
+MAIN_LOOP_INTERVAL = 1        # 主循环轮询间隔 (秒)
+DEFAULT_OTLP_PORT = 4318      # OTLP 默认端口
+
 
 
 class DesktopPetMonitor:
     """桌面电子宠物监控主程序"""
     
-    def __init__(self, config_path: str = "config/config.json"):
+    config: Dict[str, Any]
+    running: bool
+    agent_monitor: AgentMonitor
+    token_tracker: TokenTracker
+    weather_service: WeatherService
+    communication: Any
+    _otlp_receiver: OTLPReceiver
+    last_status: Optional[Any]
+    last_token_stats: Optional[Any]
+    last_weather: Optional[Any]
+    _last_token_update: float
+    _last_weather_update: float
+    
+    def __init__(self, config_path: str = "config/config.json") -> None:
         self.config = self._load_config(config_path)
         self.running = False
         
@@ -45,7 +64,7 @@ class DesktopPetMonitor:
         self.communication = create_communication(self.config.get("communication", {}))
         
         # OTLP接收器
-        otlp_port = self.config.get("otlp", {}).get("port", 4318)
+        otlp_port = self.config.get("otlp", {}).get("port", DEFAULT_OTLP_PORT)
         self._otlp_receiver = OTLPReceiver(port=otlp_port)
         self._otlp_receiver.set_span_callback(self._on_otlp_span)
         
@@ -55,19 +74,58 @@ class DesktopPetMonitor:
         self.last_weather = None
         
         # 定时器记录
-        self._last_token_update = 0
-        self._last_weather_update = 0
+        self._last_token_update = 0.0
+        self._last_weather_update = 0.0
         
-    def _load_config(self, config_path: str) -> dict:
+    def _load_config(self, config_path: str) -> Dict[str, Any]:
         """加载配置文件"""
         try:
             with open(config_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                config = json.load(f)
+            # 验证配置
+            errors = self._validate_config(config)
+            if errors:
+                for err in errors:
+                    logger.warning(f"配置验证警告: {err}")
+            return config
         except Exception as e:
             logger.error(f"加载配置失败: {e}")
             return {}
     
-    def _on_device_message(self, msg: DeviceMessage):
+    def _validate_config(self, config: Dict[str, Any]) -> list:
+        """验证配置有效性，返回警告列表"""
+        warnings = []
+        
+        # 检查agent_monitor配置
+        if "agent_monitor" in config:
+            am = config["agent_monitor"]
+            if not isinstance(am.get("url", ""), str):
+                warnings.append("agent_monitor.url 应为字符串类型")
+        
+        # 检查communication配置
+        if "communication" in config:
+            comm = config["communication"]
+            if "mode" in comm and comm["mode"] not in ["serial", "wifi"]:
+                warnings.append(f"communication.mode 值 '{comm['mode']}' 无效，应为 'serial' 或 'wifi'")
+            if comm.get("mode") == "serial":
+                if "port" not in comm:
+                    warnings.append("串口模式缺少 communication.port 配置")
+            elif comm.get("mode") == "wifi":
+                if "tcp_port" not in comm:
+                    warnings.append("WiFi模式缺少 communication.tcp_port 配置")
+        
+        # 检查token_stats配置
+        if "token_stats" in config:
+            ts = config["token_stats"]
+            if "log_file" in ts:
+                import os
+                log_path = os.path.expanduser(ts["log_file"])
+                if not os.path.exists(log_path):
+                    warnings.append(f"token_stats.log_file 路径不存在: {log_path}")
+        
+        return warnings
+    
+    def _on_device_message(self, msg: DeviceMessage) -> None:
         """处理设备消息"""
         logger.info(f"收到设备消息: {msg.msg_type} - {msg.data}")
         
@@ -79,7 +137,7 @@ class DesktopPetMonitor:
         elif msg.msg_type == "request_tokens":
             self._send_token_update()
     
-    def _send_status_update(self):
+    def _send_status_update(self) -> None:
         """发送Agent状态更新"""
         state = self.agent_monitor.get_state()
         
@@ -101,7 +159,7 @@ class DesktopPetMonitor:
         self.communication.send_message(msg)
         logger.info(f"状态已发送: {state.status.value}")
     
-    def _send_weather_update(self):
+    def _send_weather_update(self) -> None:
         """发送天气更新"""
         weather = self.weather_service.fetch_weather()
         if not weather:
@@ -126,7 +184,7 @@ class DesktopPetMonitor:
         self.communication.send_message(msg)
         logger.info(f"天气已发送: {weather.description} {weather.temperature}℃")
     
-    def _send_token_update(self):
+    def _send_token_update(self) -> None:
         """发送Token统计更新"""
         stats = self.token_tracker.get_stats()
         
@@ -145,7 +203,7 @@ class DesktopPetMonitor:
         self.communication.send_message(msg)
         logger.info(f"Token统计已发送: {stats.total_requests} 次请求")
     
-    def _periodic_update(self):
+    def _periodic_update(self) -> None:
         """定时更新任务"""
         update_interval = self.config.get("display", {}).get("update_interval", 5)
         token_interval = self.config.get("token_stats", {}).get("update_interval", 30)
@@ -173,7 +231,7 @@ class DesktopPetMonitor:
             
             time.sleep(update_interval)
     
-    def start(self):
+    def start(self) -> bool:
         """启动监控程序"""
         logger.info("=" * 50)
         logger.info("桌面电子宠物监控程序启动")
@@ -191,10 +249,9 @@ class DesktopPetMonitor:
         
         # 启动OTLP接收器
         self._otlp_receiver.start()
-        logger.info(f"OTLP接收器已启动，端口: {self.config.get('otlp', {}).get('port', 4318)}")
+        logger.info(f"OTLP接收器已启动，端口: {otlp_port}")
         
         # 启动定时更新线程
-        import threading
         update_thread = threading.Thread(target=self._periodic_update, daemon=True)
         update_thread.start()
         
@@ -203,7 +260,7 @@ class DesktopPetMonitor:
         # 主循环
         try:
             while self.running:
-                time.sleep(1)
+                time.sleep(MAIN_LOOP_INTERVAL)
         except KeyboardInterrupt:
             logger.info("收到退出信号")
         finally:
@@ -211,7 +268,7 @@ class DesktopPetMonitor:
         
         return True
     
-    def stop(self):
+    def stop(self) -> None:
         """停止监控程序"""
         logger.info("正在停止监控程序...")
         self.running = False
@@ -219,7 +276,7 @@ class DesktopPetMonitor:
         self.communication.disconnect()
         logger.info("监控程序已停止")
     
-    def _on_otlp_span(self, span):
+    def _on_otlp_span(self, span: Any) -> None:
         """处理OTLP接收的span，转发给ESP32显示"""
         status_mapping = {
             "agent.idle": "idle",
@@ -266,7 +323,7 @@ class DesktopPetMonitor:
             logger.debug(f"OTLP转发: {span.name} → {device_status}")
 
 
-def main():
+def main() -> None:
     """主函数"""
     # 设置工作目录
     os.chdir(Path(__file__).parent)
@@ -274,7 +331,7 @@ def main():
     # 信号处理
     monitor = DesktopPetMonitor()
     
-    def signal_handler(sig, frame):
+    def signal_handler(sig: int, frame: Any) -> None:
         logger.info(f"收到信号 {sig}")
         monitor.stop()
         sys.exit(0)

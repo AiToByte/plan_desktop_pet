@@ -179,6 +179,9 @@ private:
     void drawIconCloudSun(int x, int y, uint8_t frame);
     void drawIconCloudMoon(int x, int y);
 
+    // 思考链指示器
+    void drawThinkingIndicator(ThinkingState state, uint8_t stepCount);
+
     // 辅助绘制
     void drawEyes(int x, int y, int size, uint16_t color, bool blink);
     void drawMouth(int x, int y, int type, uint16_t color);

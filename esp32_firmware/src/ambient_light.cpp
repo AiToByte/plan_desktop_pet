@@ -62,13 +62,32 @@ int16_t AmbientLightManager::readLux() {
     uint16_t raw = (_wire.read() << 8) | _wire.read();
     
     // BH1750原始值÷1.2得到lux(高分辨率模式)
-    int16_t lux = (int16_t)(raw / 1.2f);
-    if (lux < 0) lux = 0;
+    int16_t rawLux = (int16_t)(raw / 1.2f);
+    if (rawLux < 0) rawLux = 0;
     
-    _lastLux = lux;
+    // EMA滤波：new = alpha * raw + (1-alpha) * old
+    _emaLux = EMA_ALPHA * rawLux + (1.0f - EMA_ALPHA) * _emaLux;
+    
+    _lastLux = (int16_t)_emaLux;
     _lastReadTime = millis();
     
-    return lux;
+    return _lastLux;
+}
+
+// ====== CIE 1931 亮度曲线 ======
+
+// CIE 1931 感知亮度映射
+// 输入: 0.0~1.0 (归一化亮度)
+// 输出: 0.0~1.0 (感知亮度，符合人眼响应)
+static float cie1931_curve(float Y) {
+    // 标准CIE 1931公式
+    // Y/Yn <= 0.008856: L* = 903.3 * Y/Yn
+    // Y/Yn > 0.008856:  L* = 116 * (Y/Yn)^(1/3) - 16
+    if (Y <= 0.008856f) {
+        return 903.3f * Y;
+    } else {
+        return 116.0f * powf(Y, 1.0f/3.0f) - 16.0f;
+    }
 }
 
 // ====== 自动背光 ======
@@ -76,21 +95,30 @@ int16_t AmbientLightManager::readLux() {
 uint8_t AmbientLightManager::autoAdjustBacklight(int16_t lux) {
     if (lux < 0) return 128;  // 读取失败时给中等亮度
     
-    // 分段线性映射
-    if (lux <= 0) {
-        return 30;   // 完全黑暗给最低亮度
-    } else if (lux <= 10) {
-        // 1~10 lx → 30~50 (最低可见)
-        return map(lux, 1, 10, 30, 50);
-    } else if (lux <= 100) {
-        // 10~100 lx → 50~128 (20%~50%)
-        return map(lux, 10, 100, 50, 128);
-    } else if (lux <= 1000) {
-        // 100~1000 lx → 128~255 (50%~100%)
-        return map(lux, 100, 1000, 128, 255);
-    } else {
-        return 255;  // 强光环境100%
-    }
+    // 归一化lux到0.0~1.0（假设最大感知亮度在10000lux）
+    // 避免浮点除法，用整数映射
+    const int16_t MAX_LUX = 10000;
+    if (lux > MAX_LUX) lux = MAX_LUX;
+    
+    // 归一化到0.0~1.0
+    float normalized = (float)lux / (float)MAX_LUX;
+    
+    // 应用CIE 1931曲线（归一化到0.0~1.0输出）
+    // CIE曲线输出范围: 0~100，归一化到0.0~1.0
+    float perceived = cie1931_curve(normalized) / 100.0f;
+    
+    // 确保输出在有效范围
+    if (perceived < 0.0f) perceived = 0.0f;
+    if (perceived > 1.0f) perceived = 1.0f;
+    
+    // 最低亮度保护（防止完全黑暗时屏幕关闭）
+    const uint8_t MIN_PWM = 15;  // 约6%亮度，确保屏幕可见
+    const uint8_t MAX_PWM = 255;
+    
+    // 映射到PWM范围
+    uint8_t pwm = MIN_PWM + (uint8_t)(perceived * (MAX_PWM - MIN_PWM));
+    
+    return pwm;
 }
 
 // ====== 功耗管理 ======

@@ -168,14 +168,45 @@ python pixel_tool.py cmd stop 192.168.1.100
 
 ## ❓ 故障排除
 
+### 连接问题
+
 | 问题 | 可能原因 | 解决方案 |
 |------|----------|----------|
 | ESP32 无法连接 WiFi | SSID/密码错误 | 检查 `config.h` 中的 WiFi 配置 |
 | ESP32 连接后断开 | 防火墙阻止 | 添加 19876 端口入站规则 |
+| 串口连接失败 | 端口被占用 | 关闭其他串口工具，检查端口号 |
+| WiFi连接超时 | 网络不稳定 | 检查PC和ESP32是否在同一网络 |
+
+### 数据问题
+
+| 问题 | 可能原因 | 解决方案 |
+|------|----------|----------|
 | 无法检测 Agent 进程 | 进程名不匹配 | 修改 `config.json` 中的 `process_names` |
 | 天气不显示 | API 密钥未配置 | 填入 OpenWeatherMap API Key |
+| Token统计不准 | 日志路径错误 | 检查 `token_stats.log_file` 配置 |
+| 数据不更新 | 定时器配置错误 | 调整 `check_interval` 参数 |
+
+### 显示问题
+
+| 问题 | 可能原因 | 解决方案 |
+|------|----------|----------|
 | 屏幕无显示 | 接线错误 | 参考 `hardware_guide.md` |
 | 中文乱码 | 字体缺失 | 确保 LovyanGFX 配置了中文字体 |
+| 动画卡顿 | 帧率过低 | 检查ESP32性能，降低动画复杂度 |
+| 像素图片不显示 | 格式错误 | 使用pixel_tool转换，确保PXL格式正确 |
+
+### 日志调试
+
+```bash
+# 查看PC端日志
+tail -f pc_monitor.log
+
+# 查看ESP32串口日志
+# Windows
+type COM3
+# Linux/Mac
+screen /dev/ttyUSB0 115200
+```
 
 ## 🛠️ 技术栈
 

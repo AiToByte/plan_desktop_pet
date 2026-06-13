@@ -46,6 +46,10 @@ static void IRAM_ATTR sineTimerISR(void* arg) {
 
 SoundManager::SoundManager()
     : _enabled(true), _initialized(false), _toneFreq(0)
+#if SOUND_I2S_PDM_ENABLED
+    , _i2sInitialized(false)
+#endif
+    , _audioMode(AUDIO_PWM)
 #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3,0,0)
     , _sineTimer(nullptr)
 #else
@@ -83,14 +87,21 @@ void SoundManager::beep(uint16_t freq, uint16_t duration) {
 // ============ 正弦波柔和音调（苹果级听感）============
 void SoundManager::beepSine(uint16_t freq, uint16_t duration) {
     if (!_enabled || !_initialized) return;
+    
+#if SOUND_I2S_PDM_ENABLED
+    // I2S-PDM模式：更高保真度
+    if (_audioMode == AUDIO_I2S_PDM && _i2sInitialized) {
+        _i2sTone(freq, duration);
+        return;
+    }
+#endif
+    
+    // PWM模式（原有实现）
     if (freq < 100 || freq > 8000) {
-        // 频率超出LUT分辨率范围，回退到方波
         beep(freq, duration);
         return;
     }
 
-    // 计算每tick步进值：step = freq * 64 / PWM_CARRIER_HZ * STEP_SCALE
-    // = (freq << STEP_FRAC_BITS) * 64 / PWM_CARRIER_HZ
     s_stepPerTick = (uint32_t)freq * SIN_LUT_SIZE * STEP_SCALE / PWM_CARRIER_HZ;
     s_stepAcc = 0;
     s_sinIdx = 0;
@@ -144,6 +155,73 @@ void SoundManager::_stopSineTimer() {
     s_stepPerTick = 0;  // 确保ISR立即停止写入
 }
 
+
+// ====== I2S-PDM 音频后端 (ESP32-S3专用) ======
+#if SOUND_I2S_PDM_ENABLED
+void SoundManager::_initI2S() {
+    // I2S配置: PDM TX模式，单声道，8-bit分辨率
+    i2s_config_t i2s_config = {};
+    i2s_config.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_PDM);
+    i2s_config.sample_rate = 44100;
+    i2s_config.bits_per_sample = I2S_BITS_PER_SAMPLE_8BIT;
+    i2s_config.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
+    i2s_config.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+    i2s_config.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+    i2s_config.dma_buf_count = 4;
+    i2s_config.dma_buf_len = 256;
+    i2s_config.use_apll = false;
+    i2s_config.tx_desc_auto_clear = true;
+
+    i2s_pin_config_t pin_config = {};
+    pin_config.bck_io_num = I2S_PIN_NO_CHANGE;
+    pin_config.ws_io_num = I2S_PIN_NO_CHANGE;
+    pin_config.data_out_num = BUZZER_PIN;
+    pin_config.data_in_num = I2S_PIN_NO_CHANGE;
+
+    esp_err_t err = i2s_driver_install(I2S_NUM_0, &i2s_config, 0, nullptr);
+    if (err != ESP_OK) {
+        Serial.printf("[Sound] I2S install failed: %d, falling back to PWM\n", err);
+        _audioMode = AUDIO_PWM;
+        return;
+    }
+    i2s_set_pin(I2S_NUM_0, &pin_config);
+    i2s_set_clk(I2S_NUM_0, 44100, I2S_BITS_PER_SAMPLE_8BIT, I2S_CHANNEL_MONO);
+    _i2sInitialized = true;
+    Serial.println("[Sound] I2S-PDM initialized on GPIO " + String(BUZZER_PIN));
+}
+
+void SoundManager::_i2sTone(uint16_t freq, uint16_t duration) {
+    if (!_i2sInitialized) return;
+    
+    // 生成正弦波DMA缓冲区
+    const int samplesPerCycle = 44100 / freq;
+    const int bufLen = (samplesPerCycle > 256) ? 256 : samplesPerCycle;
+    uint8_t buf[256];
+    
+    for (int i = 0; i < bufLen; i++) {
+        // 8-bit正弦波 (128 = 中心值，振幅120)
+        float angle = 2.0f * 3.14159f * i / bufLen;
+        buf[i] = (uint8_t)(128 + 120 * sinf(angle));
+    }
+    
+    size_t bytesWritten = 0;
+    unsigned long endTime = millis() + duration;
+    while (millis() < endTime) {
+        i2s_write(I2S_NUM_0, buf, bufLen, &bytesWritten, portMAX_DELAY);
+    }
+    
+    // 静音
+    memset(buf, 128, bufLen);
+    i2s_write(I2S_NUM_0, buf, bufLen, &bytesWritten, portMAX_DELAY);
+}
+
+void SoundManager::setAudioMode(AudioMode mode) {
+    _audioMode = mode;
+    if (mode == AUDIO_I2S_PDM && !_i2sInitialized) {
+        _initI2S();
+    }
+}
+#endif  // SOUND_I2S_PDM_ENABLED
 // ============ 复合音效 ============
 void SoundManager::beepPattern(uint16_t freq, uint16_t onMs, uint16_t offMs, uint8_t count) {
     for (uint8_t i = 0; i < count; i++) {

@@ -9,7 +9,26 @@ import time
 import logging
 import threading
 from typing import Callable, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+# 默认配置常量
+DEFAULT_SERIAL_PORT = "COM3"
+DEFAULT_SERIAL_BAUD = 115200
+DEFAULT_WIFI_HOST = "0.0.0.0"
+DEFAULT_WIFI_PORT = 19876
+DEFAULT_UDP_BROADCAST_PORT = 19877
+DEFAULT_RETRY_INTERVAL = 5
+DEFAULT_UDP_BROADCAST_INTERVAL = 5
+DEFAULT_SERIAL_TIMEOUT = 1
+DEFAULT_SOCKET_ACCEPT_TIMEOUT = 1
+DEFAULT_SOCKET_CLIENT_TIMEOUT = 5
+DEFAULT_RECONNECT_ATTEMPTS = 3
+DEFAULT_RECONNECT_DELAY = 2
+SERIAL_READ_POLL_INTERVAL = 0.01
+ERROR_RECOVERY_DELAY = 0.1
+BROADCAST_SLEEP_STEP = 0.1
+RECV_BUFFER_SIZE = 4096
+MDNS_HOSTNAME = "deskpet.local"
 
 logger = logging.getLogger(__name__)
 
@@ -17,9 +36,9 @@ logger = logging.getLogger(__name__)
 @dataclass
 class DeviceMessage:
     """设备消息"""
-    msg_type: str       # 消息类型: status, token, weather, animation
-    data: dict          # 消息数据
-    timestamp: float    # 时间戳
+    msg_type: str                           # 消息类型: status, token, weather, animation
+    data: dict = field(default_factory=dict) # 消息数据
+    timestamp: float = field(default_factory=time.time)  # 时间戳
 
 
 class CommunicationBase:
@@ -27,10 +46,13 @@ class CommunicationBase:
     
     def __init__(self):
         self._connected = False
-        self._message_callback: Optional[Callable] = None
+        self._message_callback: Optional[Callable[[DeviceMessage], None]] = None
         self._running = False
+        self._reconnect_attempts: int = 0
+        self._max_reconnect_attempts: int = DEFAULT_RECONNECT_ATTEMPTS
+        self._reconnect_delay: float = DEFAULT_RECONNECT_DELAY
     
-    def set_message_callback(self, callback: Callable):
+    def set_message_callback(self, callback: Callable[[DeviceMessage], None]):
         """设置消息回调"""
         self._message_callback = callback
     
@@ -46,14 +68,28 @@ class CommunicationBase:
     def is_connected(self) -> bool:
         return self._connected
 
+    def _process_received(self, data: str) -> None:
+        """处理接收到的数据（解析JSON并触发回调）"""
+        try:
+            msg_data = json.loads(data)
+            msg = DeviceMessage(
+                msg_type=msg_data.get("type", "unknown"),
+                data=msg_data.get("data", {}),
+                timestamp=msg_data.get("ts", time.time())
+            )
+            if self._message_callback:
+                self._message_callback(msg)
+        except json.JSONDecodeError:
+            logger.warning(f"收到无效JSON: {data}")
+
 
 class SerialCommunication(CommunicationBase):
     """串口通信"""
     
     def __init__(self, config: dict):
         super().__init__()
-        self.port = config.get("serial_port", "COM3")
-        self.baudrate = config.get("serial_baud", 115200)
+        self.port = config.get("serial_port", DEFAULT_SERIAL_PORT)
+        self.baudrate = config.get("serial_baud", DEFAULT_SERIAL_BAUD)
         self._serial: Optional[serial.Serial] = None
         self._read_thread: Optional[threading.Thread] = None
     
@@ -63,7 +99,7 @@ class SerialCommunication(CommunicationBase):
             self._serial = serial.Serial(
                 port=self.port,
                 baudrate=self.baudrate,
-                timeout=1
+                timeout=DEFAULT_SERIAL_TIMEOUT
             )
             self._connected = True
             self._running = True
@@ -90,6 +126,14 @@ class SerialCommunication(CommunicationBase):
     def send_message(self, msg: DeviceMessage) -> bool:
         """发送消息（带长度前缀帧）"""
         if not self._connected or not self._serial:
+            # 尝试重连
+            if self._reconnect_attempts < self._max_reconnect_attempts:
+                logger.info(f"尝试重连 ({self._reconnect_attempts + 1}/{self._max_reconnect_attempts})")
+                if self.connect():
+                    self._reconnect_attempts = 0
+                else:
+                    self._reconnect_attempts += 1
+                    time.sleep(self._reconnect_delay)
             return False
         
         try:
@@ -100,10 +144,25 @@ class SerialCommunication(CommunicationBase):
             })
             frame = f"LEN:{len(payload)}\n{payload}\n"
             self._serial.write(frame.encode('utf-8'))
+            self._reconnect_attempts = 0  # 发送成功，重置重连计数
             return True
             
         except Exception as e:
             logger.error(f"发送消息失败: {e}")
+            # 尝试重连
+            if self._reconnect_attempts < self._max_reconnect_attempts:
+                logger.info(f"发送失败，尝试重连 ({self._reconnect_attempts + 1}/{self._max_reconnect_attempts})")
+                if self.connect():
+                    self._reconnect_attempts = 0
+                    # 重新发送
+                    try:
+                        self._serial.write(frame.encode('utf-8'))
+                        return True
+                    except Exception as retry_e:
+                        logger.error(f"重连后重试发送失败: {retry_e}")
+                else:
+                    self._reconnect_attempts += 1
+                    time.sleep(self._reconnect_delay)
             return False
     
     def _read_loop(self):
@@ -140,39 +199,23 @@ class SerialCommunication(CommunicationBase):
                     else:
                         buffer += char
                 else:
-                    time.sleep(0.01)
+                    time.sleep(SERIAL_READ_POLL_INTERVAL)
                     
             except Exception as e:
                 logger.error(f"读取串口数据错误: {e}")
-                time.sleep(0.1)
+                time.sleep(ERROR_RECOVERY_DELAY)
     
-    def _process_received(self, data: str):
-        """处理接收到的数据"""
-        try:
-            msg_data = json.loads(data)
-            msg = DeviceMessage(
-                msg_type=msg_data.get("type", "unknown"),
-                data=msg_data.get("data", {}),
-                timestamp=msg_data.get("ts", time.time())
-            )
-            
-            if self._message_callback:
-                self._message_callback(msg)
-                
-        except json.JSONDecodeError:
-            logger.warning(f"收到无效JSON: {data}")
-
 
 class WiFiCommunication(CommunicationBase):
     """WiFi通信（PC端作为TCP Server，等待ESP32连接）"""
     
     def __init__(self, config: dict):
         super().__init__()
-        self.host = config.get("wifi_host", "0.0.0.0")
-        self.port = config.get("wifi_port", 19876)
-        self.retry_interval = config.get("retry_interval", 5)
-        self.udp_broadcast_port = config.get("udp_broadcast_port", 19877)
-        self.udp_broadcast_interval = config.get("udp_broadcast_interval", 5)
+        self.host = config.get("wifi_host", DEFAULT_WIFI_HOST)
+        self.port = config.get("wifi_port", DEFAULT_WIFI_PORT)
+        self.retry_interval = config.get("retry_interval", DEFAULT_RETRY_INTERVAL)
+        self.udp_broadcast_port = config.get("udp_broadcast_port", DEFAULT_UDP_BROADCAST_PORT)
+        self.udp_broadcast_interval = config.get("udp_broadcast_interval", DEFAULT_UDP_BROADCAST_INTERVAL)
         self._server_socket: Optional[socket.socket] = None
         self._client_socket: Optional[socket.socket] = None
         self._client_addr: Optional[tuple] = None
@@ -182,7 +225,7 @@ class WiFiCommunication(CommunicationBase):
         self._lock = threading.Lock()
     
     @staticmethod
-    def resolve_mdns(hostname: str = "deskpet.local") -> Optional[str]:
+    def resolve_mdns(hostname: str = MDNS_HOSTNAME) -> Optional[str]:
         """通过mDNS解析设备主机名，返回IP或None"""
         try:
             addr = socket.getaddrinfo(hostname, None, socket.AF_INET)
@@ -199,7 +242,7 @@ class WiFiCommunication(CommunicationBase):
         try:
             self._server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self._server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self._server_socket.settimeout(1)
+            self._server_socket.settimeout(DEFAULT_SOCKET_ACCEPT_TIMEOUT)
             self._server_socket.bind((self.host, self.port))
             self._server_socket.listen(1)
             
@@ -226,14 +269,14 @@ class WiFiCommunication(CommunicationBase):
         while self._running:
             try:
                 client_socket, client_addr = self._server_socket.accept()
-                client_socket.settimeout(5)
+                client_socket.settimeout(DEFAULT_SOCKET_CLIENT_TIMEOUT)
                 
                 with self._lock:
                     # 如果已有连接，关闭旧连接
                     if self._client_socket:
                         try:
                             self._client_socket.close()
-                        except:
+                        except Exception:
                             pass
                     
                     self._client_socket = client_socket
@@ -288,11 +331,11 @@ class WiFiCommunication(CommunicationBase):
             for _ in range(int(self.udp_broadcast_interval * 10)):
                 if not self._running:
                     break
-                time.sleep(0.1)
+                time.sleep(BROADCAST_SLEEP_STEP)
         
         try:
             udp_sock.close()
-        except:
+        except Exception:
             pass
         logger.info("UDP广播已停止")
     
@@ -305,7 +348,7 @@ class WiFiCommunication(CommunicationBase):
             if self._client_socket:
                 try:
                     self._client_socket.close()
-                except:
+                except Exception:
                     pass
                 self._client_socket = None
                 self._client_addr = None
@@ -313,7 +356,7 @@ class WiFiCommunication(CommunicationBase):
             if self._server_socket:
                 try:
                     self._server_socket.close()
-                except:
+                except Exception:
                     pass
                 self._server_socket = None
         
@@ -323,6 +366,11 @@ class WiFiCommunication(CommunicationBase):
         """发送消息到已连接的ESP32（带长度前缀帧）"""
         with self._lock:
             if not self._client_socket:
+                # 尝试重连
+                if self._reconnect_attempts < self._max_reconnect_attempts:
+                    logger.info(f"无客户端连接，等待新连接 ({self._reconnect_attempts + 1}/{self._max_reconnect_attempts})")
+                    self._reconnect_attempts += 1
+                    time.sleep(self._reconnect_delay)
                 return False
             
             try:
@@ -333,6 +381,7 @@ class WiFiCommunication(CommunicationBase):
                 })
                 frame = f"LEN:{len(payload)}\n{payload}\n"
                 self._client_socket.sendall(frame.encode('utf-8'))
+                self._reconnect_attempts = 0  # 发送成功，重置重连计数
                 return True
                 
             except Exception as e:
@@ -340,6 +389,11 @@ class WiFiCommunication(CommunicationBase):
                 self._client_socket = None
                 self._client_addr = None
                 self._connected = False
+                # 尝试重连
+                if self._reconnect_attempts < self._max_reconnect_attempts:
+                    logger.info(f"发送失败，等待新连接 ({self._reconnect_attempts + 1}/{self._max_reconnect_attempts})")
+                    self._reconnect_attempts += 1
+                    time.sleep(self._reconnect_delay)
                 return False
     
     def _read_loop(self):

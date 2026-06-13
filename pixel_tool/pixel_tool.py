@@ -8,6 +8,7 @@ import os
 import argparse
 import struct
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -15,7 +16,7 @@ from pxl_encoder import image_to_pxl, gif_to_pxl, png_to_pxl_frames
 from pxl_sender import send_pxl_to_esp32, send_pixel_command
 
 
-def cmd_convert(args):
+def cmd_convert(args: Any) -> int:
     """转换命令：图片/GIF -> .pxl"""
     src = Path(args.input)
     if not src.exists():
@@ -37,7 +38,7 @@ def cmd_convert(args):
     return 0
 
 
-def cmd_send(args):
+def cmd_send(args: Any) -> int:
     """发送命令：.pxl -> ESP32"""
     pxl = Path(args.file)
     if not pxl.exists():
@@ -51,13 +52,13 @@ def cmd_send(args):
     return 0 if ok else 1
 
 
-def cmd_cmd(args):
+def cmd_cmd(args: Any) -> int:
     """控制命令：发送控制指令到ESP32"""
     ok = send_pixel_command(args.host, args.port, args.command, args.mode)
     return 0 if ok else 1
 
 
-def cmd_info(args):
+def cmd_info(args: Any) -> int:
     """信息命令：查看.pxl文件信息"""
     pxl = Path(args.file)
     if not pxl.exists():
@@ -100,7 +101,7 @@ def cmd_info(args):
     return 0
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(
         description='Pixel Tool - 桌面宠物自定义像素工具',
         formatter_class=argparse.RawDescriptionHelpFormatter,

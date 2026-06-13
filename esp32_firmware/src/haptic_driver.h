@@ -57,6 +57,9 @@ public:
     // 停止当前效果
     void stop();
 
+    // 自动校准LRA参数（自动调用begin()后）
+    bool calibrate();
+    
     // 设置马达类型
     // 0=ERM(偏心旋转), 1=LRA(线性谐振)
     void setMotorType(uint8_t type);

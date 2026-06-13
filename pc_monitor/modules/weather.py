@@ -1,16 +1,37 @@
 """
 天气信息获取模块
 调用天气API获取实时天气数据
+
+功能：
+- 获取实时天气信息
+- 支持多种天气图标映射
+- 缓存机制减少API调用
+- 根据Agent状态动态调整刷新频率
 """
 import os
-import requests
 import time
 import json
 import logging
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 from dataclasses import dataclass
 
+import requests
+from requests.exceptions import RequestException, Timeout
+
 logger = logging.getLogger(__name__)
+
+# 常量定义
+DEFAULT_API_TIMEOUT: int = 10  # 秒
+DEFAULT_UPDATE_INTERVAL: int = 1800  # 30分钟
+DEFAULT_UPDATE_INTERVAL_IDLE: int = 3600  # 1小时
+DEFAULT_UPDATE_INTERVAL_WORKING: int = 600  # 10分钟
+DEFAULT_CITY: str = "Beijing"
+DEFAULT_TEMPERATURE: float = 22.0
+DEFAULT_HUMIDITY: int = 45
+DEFAULT_WIND_SPEED: float = 3.5
+DEFAULT_DESCRIPTION: str = "晴"
+DEFAULT_ICON_CODE: str = "01d"
+MOCK_CITY_SUFFIX: str = "_mock"
 
 
 @dataclass
@@ -27,13 +48,18 @@ class WeatherInfo:
 
 
 class WeatherService:
-    """天气服务"""
+    """天气服务
+    
+    Attributes:
+        BASE_URL: OpenWeatherMap API地址
+        ICON_MAP: 天气图标代码到ESP32显示名称的映射
+    """
     
     # OpenWeatherMap API
-    BASE_URL = "https://api.openweathermap.org/data/2.5/weather"
+    BASE_URL: str = "https://api.openweathermap.org/data/2.5/weather"
     
     # 天气图标映射 (用于ESP32显示)
-    ICON_MAP = {
+    ICON_MAP: Dict[str, str] = {
         "01d": "sun",           # 晴天
         "01n": "moon",          # 晴夜
         "02d": "cloud_sun",     # 少云
@@ -54,16 +80,21 @@ class WeatherService:
         "50n": "fog"
     }
     
-    def __init__(self, config: dict):
-        self.api_key = config.get("api_key", "")
-        self.city = config.get("city", "Beijing")
-        self.update_interval = config.get("update_interval", 1800)
-        self.update_interval_idle = config.get("update_interval_idle", 3600)     # 空闲时刷新间隔(秒)
-        self.update_interval_working = config.get("update_interval_working", 600) # 工作中刷新间隔(秒)
-        self.cache_file = config.get("cache_file", "weather_cache.json")
-        self._cached_weather = None
-        self._last_update = 0
-        self._agent_status = "idle"  # 当前Agent状态
+    def __init__(self, config: Dict[str, Any]) -> None:
+        """初始化天气服务
+        
+        Args:
+            config: 配置字典，包含api_key, city, update_interval等
+        """
+        self.api_key: str = config.get("api_key", "")
+        self.city: str = config.get("city", DEFAULT_CITY)
+        self.update_interval: int = config.get("update_interval", DEFAULT_UPDATE_INTERVAL)
+        self.update_interval_idle: int = config.get("update_interval_idle", DEFAULT_UPDATE_INTERVAL_IDLE)
+        self.update_interval_working: int = config.get("update_interval_working", DEFAULT_UPDATE_INTERVAL_WORKING)
+        self.cache_file: str = config.get("cache_file", "weather_cache.json")
+        self._cached_weather: Optional[Dict[str, Any]] = None
+        self._last_update: float = 0.0
+        self._agent_status: str = "idle"
         self._load_cache()
     
     def set_agent_status(self, status: str):
@@ -97,7 +128,13 @@ class WeatherService:
             logger.warning(f"保存天气缓存失败: {e}")
     
     def fetch_weather(self) -> Optional[WeatherInfo]:
-        """获取天气信息"""
+        """获取天气信息
+        
+        优先使用缓存，缓存过期则请求API。API失败时返回缓存或模拟数据。
+        
+        Returns:
+            WeatherInfo对象，失败时返回模拟数据
+        """
         now = time.time()
         
         # 检查缓存是否有效（根据Agent状态动态调整间隔）
@@ -111,60 +148,81 @@ class WeatherService:
             return self._get_mock_weather()
         
         try:
-            params = {
+            params: Dict[str, str] = {
                 "q": self.city,
                 "appid": self.api_key,
                 "units": "metric",
                 "lang": "zh_cn"
             }
             
-            response = requests.get(self.BASE_URL, params=params, timeout=10)
+            response = requests.get(
+                self.BASE_URL, 
+                params=params, 
+                timeout=DEFAULT_API_TIMEOUT
+            )
             response.raise_for_status()
             
-            data = response.json()
+            data: Dict[str, Any] = response.json()
             self._cached_weather = data
             self._last_update = now
             self._save_cache(data)
             
             return self._parse_weather(data)
             
+        except Timeout:
+            logger.error("天气API请求超时")
+        except RequestException as e:
+            logger.error(f"天气API请求失败: {e}")
+        except (ValueError, KeyError) as e:
+            logger.error(f"天气数据解析错误: {e}")
         except Exception as e:
-            logger.error(f"获取天气失败: {e}")
-            if self._cached_weather:
-                return self._parse_weather(self._cached_weather)
-            return self._get_mock_weather()
+            logger.error(f"获取天气时发生未知错误: {e}", exc_info=True)
+        
+        # 降级：返回缓存或模拟数据
+        if self._cached_weather:
+            logger.info("使用缓存的天气数据")
+            return self._parse_weather(self._cached_weather)
+        return self._get_mock_weather()
     
-    def _parse_weather(self, data: dict) -> Optional[WeatherInfo]:
-        """解析天气数据"""
+    def _parse_weather(self, data: Dict[str, Any]) -> Optional[WeatherInfo]:
+        """解析天气API返回的数据
+        
+        Args:
+            data: OpenWeatherMap API返回的JSON数据
+            
+        Returns:
+            WeatherInfo对象，解析失败返回None
+        """
         try:
-            main = data.get("main", {})
-            weather = data.get("weather", [{}])[0]
-            wind = data.get("wind", {})
+            main: Dict[str, Any] = data.get("main", {})
+            weather_list: list = data.get("weather", [{}])
+            weather: Dict[str, Any] = weather_list[0] if weather_list else {}
+            wind: Dict[str, Any] = data.get("wind", {})
             
             return WeatherInfo(
-                city=data.get("name", self.city),
-                temperature=main.get("temp", 0),
-                feels_like=main.get("feels_like", 0),
-                humidity=main.get("humidity", 0),
-                description=weather.get("description", "未知"),
-                icon_code=weather.get("icon", "01d"),
-                wind_speed=wind.get("speed", 0),
+                city=str(data.get("name", self.city)),
+                temperature=float(main.get("temp", 0)),
+                feels_like=float(main.get("feels_like", 0)),
+                humidity=int(main.get("humidity", 0)),
+                description=str(weather.get("description", "未知")),
+                icon_code=str(weather.get("icon", DEFAULT_ICON_CODE)),
+                wind_speed=float(wind.get("speed", 0)),
                 timestamp=time.time()
             )
-        except Exception as e:
+        except (ValueError, KeyError, IndexError, TypeError) as e:
             logger.error(f"解析天气数据失败: {e}")
             return None
     
     def _get_mock_weather(self) -> WeatherInfo:
-        """返回模拟天气数据"""
+        """返回模拟天气数据（API不可用时的降级方案）"""
         return WeatherInfo(
             city=self.city,
-            temperature=22.0,
-            feels_like=21.0,
-            humidity=45,
-            description="晴",
-            icon_code="01d",
-            wind_speed=3.5,
+            temperature=DEFAULT_TEMPERATURE,
+            feels_like=DEFAULT_TEMPERATURE - 1.0,
+            humidity=DEFAULT_HUMIDITY,
+            description=DEFAULT_DESCRIPTION,
+            icon_code=DEFAULT_ICON_CODE,
+            wind_speed=DEFAULT_WIND_SPEED,
             timestamp=time.time()
         )
     

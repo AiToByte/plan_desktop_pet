@@ -19,6 +19,11 @@ from dataclasses import dataclass, field
 logger = logging.getLogger(__name__)
 
 
+
+# OTLP Span Kind 映射
+_SPAN_KIND_MAP = {0: "INTERNAL", 1: "SERVER", 2: "CLIENT", 3: "PRODUCER", 4: "CONSUMER"}
+_NS_PER_SECOND = 1_000_000_000  # 纳秒 → 秒
+
 @dataclass
 class OTLPSpan:
     """从 OTLP trace 中提取的 span 信息"""
@@ -237,8 +242,8 @@ class OTLPReceiver:
             start_ns = int(data.get("startTimeUnixNano", "0"))
             end_ns = int(data.get("endTimeUnixNano", "0"))
             
-            start_time = start_ns / 1e9 if start_ns else 0
-            end_time = end_ns / 1e9 if end_ns else 0
+            start_time = start_ns / _NS_PER_SECOND if start_ns else 0
+            end_time = end_ns / _NS_PER_SECOND if end_ns else 0
             duration_ms = (end_time - start_time) * 1000 if start_ns and end_ns else 0
             
             # 状态
@@ -268,7 +273,7 @@ class OTLPReceiver:
             for event_data in data.get("events", []):
                 event = {
                     "name": event_data.get("name", ""),
-                    "timestamp": int(event_data.get("timeUnixNano", "0")) / 1e9,
+                    "timestamp": int(event_data.get("timeUnixNano", "0")) / _NS_PER_SECOND,
                     "attributes": {}
                 }
                 for attr in event_data.get("attributes", []):
@@ -279,11 +284,7 @@ class OTLPReceiver:
                 events.append(event)
             
             # Span Kind
-            kind_map = {
-                0: "INTERNAL", 1: "SERVER", 2: "CLIENT",
-                3: "PRODUCER", 4: "CONSUMER"
-            }
-            kind = kind_map.get(data.get("kind", 0), "INTERNAL")
+            kind = _SPAN_KIND_MAP.get(data.get("kind", 0), "INTERNAL")
             
             return OTLPSpan(
                 trace_id=data.get("traceId", ""),

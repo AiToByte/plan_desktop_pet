@@ -12,6 +12,12 @@ PXL_FLAG_RLE = 0x0002  # flags bit1: RLE压缩
 DEFAULT_SIZE = (32, 32)
 DEFAULT_INTERVAL = 200  # ms
 
+# RLE压缩参数
+RLE_MAX_COUNT = 127      # 单次run/literal最大长度
+RLE_MIN_RUN = 3          # 最小run长度(短于此用literal)
+RGB565_BYTES = 2         # 每像素字节数
+PXL_HEADER_BYTES = 16    # PXL文件头大小
+
 
 def rgb888_to_rgb565(r, g, b):
     """RGB888 -> RGB565"""
@@ -48,13 +54,13 @@ def rle_compress(rgb565_data: bytes) -> bytes:
         run_len = 1
         if pos + 1 < total:
             pixel0 = struct.unpack_from('<H', rgb565_data, pos * 2)[0]
-            while pos + run_len < total and run_len < 127:
+            while pos + run_len < total and run_len < RLE_MAX_COUNT:
                 pixel_n = struct.unpack_from('<H', rgb565_data, (pos + run_len) * 2)[0]
                 if pixel_n != pixel0:
                     break
                 run_len += 1
 
-        if run_len >= 3:
+        if run_len >= RLE_MIN_RUN:
             # 写入run: flag=0x80|count, pixel(big-endian)
             result.append(0x80 | run_len)
             result.extend(struct.pack('>H', pixel0))
@@ -62,7 +68,7 @@ def rle_compress(rgb565_data: bytes) -> bytes:
         else:
             # 收集literal序列
             lit_start = pos
-            while pos < total and (pos - lit_start) < 127:
+            while pos < total and (pos - lit_start) < RLE_MAX_COUNT:
                 # 检查是否接下来出现3+连续重复
                 if pos + 2 < total:
                     p = struct.unpack_from('<H', rgb565_data, pos * 2)[0]
@@ -144,7 +150,7 @@ def gif_to_pxl(gif_path: str, output_path: str = None, size: tuple = DEFAULT_SIZ
     try:
         duration = gif.info.get('duration', 100)
         interval = max(50, duration)
-    except Exception:
+    except (KeyError, AttributeError):
         interval = DEFAULT_INTERVAL
 
     header = create_pxl_header(size[0], size[1], len(frames), interval, flags=1 if loop else 0)

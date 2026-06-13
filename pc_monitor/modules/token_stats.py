@@ -14,6 +14,15 @@ from typing import Dict, Optional, List
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+# --- 常量 (token_stats) ---
+DEFAULT_UPDATE_INTERVAL = 30          # 默认轮询间隔 (秒)
+STATS_CACHE_TTL = 10                  # 统计缓存TTL (秒)
+RECORD_RETENTION_HOURS = 86400        # 24小时 = 86400秒
+HOUR_SECONDS = 3600                   # 1小时
+DAY_SECONDS = 86400                   # 24小时
+MAX_STATS_HISTORY = 1000              # stats_history 最大条数
+MAX_ACCUMULATED_RECORDS = 10000       # 累计记录上限 (防内存泄漏)
+
 logger = logging.getLogger(__name__)
 
 
@@ -98,7 +107,7 @@ class TokenTracker:
     
     def __init__(self, config: dict):
         self.log_paths = config.get("log_paths", [])
-        self.update_interval = config.get("update_interval", 30)
+        self.update_interval = config.get("update_interval", DEFAULT_UPDATE_INTERVAL)
         # JSONL自动发现配置
         self.auto_discover = config.get("auto_discover", False)
         self.auto_discover_dirs = config.get("auto_discover_dirs", [])
@@ -202,11 +211,8 @@ class TokenTracker:
             if os.path.isfile(log_path):
                 all_files.append(log_path)
             else:
-                all_files.extend(
-                    os.path.join(log_path, f) 
-                    for f in os.listdir(log_path) 
-                    if f.endswith(('.log', '.txt', '.json', '.jsonl'))
-                )
+                all_files.extend(str(p) for p in Path(log_path).glob('*') 
+                                 if p.suffix in ('.log', '.txt', '.json', '.jsonl'))
         
         # 追加自动发现的JSONL文件
         discovered = self._discover_log_files()
@@ -223,7 +229,7 @@ class TokenTracker:
                     self._accumulated_records.append(tokens)
         
         # 滑动窗口：仅保留最近24小时数据，防止长期运行内存泄漏
-        cutoff_time = now - 86400
+        cutoff_time = now - RECORD_RETENTION_HOURS
         self._accumulated_records = [
             r for r in self._accumulated_records if r.get("timestamp", 0) > cutoff_time
         ]
@@ -235,7 +241,7 @@ class TokenTracker:
         now = time.time()
         # 10秒内返回缓存
         if (self._cached_stats and 
-            now - self._last_scan_time < 10 and 
+            now - self._last_scan_time < STATS_CACHE_TTL and 
             self._last_scan_time > 0):
             return self._cached_stats
 
@@ -248,8 +254,8 @@ class TokenTracker:
         total_requests = len(records)
         
         # 计算最近1小时和24小时的使用量
-        hour_ago = now - 3600
-        day_ago = now - 86400
+        hour_ago = now - HOUR_SECONDS
+        day_ago = now - DAY_SECONDS
         
         tokens_hour = sum(
             r["input_tokens"] + r["output_tokens"] 
@@ -279,7 +285,7 @@ class TokenTracker:
             "total_tokens": total_input + total_output,
             "requests": total_requests
         })
-        self._stats_history = self._stats_history[-1000:]  # 限制内存列表大小，防止长期运行内存泄漏
+        self._stats_history = self._stats_history[-MAX_STATS_HISTORY:]  # 限制内存列表大小，防止长期运行内存泄漏
         self._save_cache()
         
         self._cached_stats = stats

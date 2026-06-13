@@ -114,10 +114,10 @@ void CommManager::reconnect() {
 void CommManager::update() {
     if (!_connected) return;
     
-    // [Step 2] 批量TCP读取：readBytes替代逐char read()，减少WiFi驱动开销
-    // 支持跨多个update()调用累积完整帧，修复大消息截断问题
+    // [Step 2] 非阻塞TCP读取：用read()替代readBytes()避免阻塞
+    // read()只读取当前available()的数据，不会阻塞等待
     while (_client.connected() && _client.available()) {
-        size_t bytesRead = _client.readBytes(_readBuf, CLIENT_READ_BUF_SIZE);
+        size_t bytesRead = _client.read(_readBuf, min((int)CLIENT_READ_BUF_SIZE, _client.available()));
         for (size_t i = 0; i < bytesRead; i++) {
             char c = _readBuf[i];
         

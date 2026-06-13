@@ -90,6 +90,7 @@ void DisplayManager::update(const DisplayData& data) {
     _sprite.fillScreen(COLOR_BG);
     drawHeader();
     drawStatusBar(data.agent);
+    drawThinkingIndicator(data.thinkingState, 0);
     drawWeatherPanel(data.weather);
     drawTokenPanel(data.tokens);
     drawFaceAnimation();
@@ -955,4 +956,44 @@ void DisplayManager::_fadeBlend() {
         if (elapsed < 16) delay(16 - elapsed);
     }
     free(blendBuf);
+}
+
+void DisplayManager::drawThinkingIndicator(ThinkingState state, uint8_t stepCount) {
+    if (state == THINK_IDLE) return;
+    
+    int x = SCREEN_WIDTH - 60;
+    int y = 2;
+    int w = 58;
+    int h = 10;
+    
+    _sprite.fillRect(x, y, w, h, COLOR_PANEL);
+    
+    uint16_t dotColor;
+    const char* label;
+    switch (state) {
+        case THINK_THINKING:  dotColor = 0x07E0; label = "think"; break;  // green
+        case THINK_TOOL_CALL: dotColor = 0xFFE0; label = "tool";  break;  // yellow
+        case THINK_RESPONDING:dotColor = 0x001F; label = "resp";  break;  // blue
+        case THINK_ERROR:     dotColor = 0xF800; label = "err";   break;  // red
+        case THINK_DONE:      dotColor = 0x07E0; label = "done";  break;  // green
+        default: return;
+    }
+    
+    // Blinking dot
+    static uint8_t blink = 0;
+    blink++;
+    if (blink & 0x04) {
+        _sprite.fillCircle(x + 4, y + 5, 3, dotColor);
+    }
+    
+    _sprite.setTextSize(1);
+    _sprite.setTextColor(0xFFFF);
+    _sprite.setCursor(x + 10, y + 2);
+    _sprite.print(label);
+    
+    // Step count
+    if (stepCount > 0) {
+        _sprite.setCursor(x + 36, y + 2);
+        _sprite.printf("%d", stepCount);
+    }
 }

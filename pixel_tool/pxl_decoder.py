@@ -12,6 +12,10 @@ PXL_HEADER_SIZE = 16
 PXL_FLAG_LOOP = 0x0001
 PXL_FLAG_RLE = 0x0002
 
+# RLE参数(与encoder一致)
+RLE_MAX_COUNT = 127
+RGB565_BYTES = 2
+
 
 def read_pxl_header(data: bytes) -> dict:
     """读取PXL文件头"""
@@ -36,19 +40,19 @@ def rle_decompress(compressed: bytes, pixel_count: int) -> bytes:
         compressed: RLE压缩后的字节流
         pixel_count: 期望的像素总数
     Returns:
-        解压后的RGB565字节流 (pixel_count * 2 bytes)
+        解压后的RGB565字节流 (pixel_count * RGB565_BYTES bytes)
     """
-    result = bytearray(pixel_count * 2)
+    result = bytearray(pixel_count * RGB565_BYTES)
     src = 0
     dst = 0
 
-    while dst < pixel_count * 2 and src < len(compressed):
+    while dst < pixel_count * RGB565_BYTES and src < len(compressed):
         flag = compressed[src]
         src += 1
 
         if flag & 0x80:
             # Run: flag & 0x7F 次重复像素(big-endian)
-            count = flag & 0x7F
+            count = flag & RLE_MAX_COUNT
             pixel_be = (compressed[src] << 8) | compressed[src + 1]
             src += 2
             pixel_le = struct.pack('<H', pixel_be)
@@ -64,7 +68,7 @@ def rle_decompress(compressed: bytes, pixel_count: int) -> bytes:
             src += byte_count
             dst += byte_count
 
-    return bytes(result[:pixel_count * 2])
+    return bytes(result[:pixel_count * RGB565_BYTES])
 
 
 def pxl_to_frames(pxl_path: str) -> list:
@@ -113,13 +117,13 @@ def _calc_rle_consumed(compressed: bytes, pixel_count: int) -> int:
     """计算解压pixel_count个像素需要消耗的压缩字节数"""
     src = 0
     dst = 0
-    target = pixel_count * 2
+    target = pixel_count * RGB565_BYTES
 
     while dst < target and src < len(compressed):
         flag = compressed[src]
         src += 1
         if flag & 0x80:
-            count = flag & 0x7F
+            count = flag & RLE_MAX_COUNT
             src += 2
             dst += count * 2
         else:

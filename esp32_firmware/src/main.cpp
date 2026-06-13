@@ -14,6 +14,7 @@
 #include "pixel_player.h"
 #include "wifi_manager.h"
 #include "comm_manager.h"
+#include "ble_config.h"
 #include "sound_manager.h"
 #include "touch_handler.h"
 #include <esp_ota_ops.h>
@@ -159,6 +160,40 @@ void commTask(void* pvParameters) {
         
         vTaskDelay(pdMS_TO_TICKS(10));  // 让出CPU，避免看门狗超时
     }
+
+    else if (type == "thinking_status") {
+        // 思考链状态 (from OTLP ThinkingChainTracker)
+        StaticJsonDocument<256> filter;
+        filter["type"] = true;
+        filter["data"]["state"] = true;
+        filter["data"]["name"] = true;
+        filter["data"]["tool"] = true;
+        filter["data"]["step_count"] = true;
+        
+        StaticJsonDocument<256> doc;
+        DeserializationError error = deserializeJson(doc, json, DeserializationOption::Filter(filter));
+        if (error) { Serial.printf("[JSON] thinking parse error: %s\n", error.c_str()); return; }
+        
+        JsonObject data = doc["data"];
+        String state = data["state"] | "idle";
+        
+        ThinkingState ts = THINK_IDLE;
+        if (state == "thinking") ts = THINK_THINKING;
+        else if (state == "tool_call") ts = THINK_TOOL_CALL;
+        else if (state == "responding") ts = THINK_RESPONDING;
+        else if (state == "error") ts = THINK_ERROR;
+        else if (state == "done") ts = THINK_DONE;
+        
+        {
+            int backIdx = 1 - g_frontIdx.load(std::memory_order_acquire);
+            g_displayBuf[backIdx] = g_displayBuf[g_frontIdx.load(std::memory_order_acquire)];
+            g_displayBuf[backIdx].thinkingState = ts;
+            g_frontIdx.store(backIdx, std::memory_order_release);
+        }
+        
+        Serial.printf("[Thinking] state=%s tool=%s step=%d\n",
+            state.c_str(), (data["tool"] | "").as<const char*>(), data["step_count"] | 0);
+    }
 }
 
 // ============ 渲染任务 (Core 1) ============
@@ -215,8 +250,15 @@ void renderTask(void* pvParameters) {
                 display.sleep();
                 esp_sleep_enable_touchpad_wakeup();
                 esp_sleep_enable_wifi_beacon_wakeup();
+                // RTC IO状态保持：锁定关键引脚电平，防止Light Sleep期间漂移
+                gpio_hold_en((gpio_num_t)LCD_BL);       // 背光保持低电平
+                gpio_hold_en((gpio_num_t)BUZZER_PIN);   // 蜂鸣器保持低电平（静音）
+                gpio_hold_en((gpio_num_t)LCD_CS);       // SPI片选保持高电平（未选中）
                 esp_light_sleep_start();
                 // === 唤醒 ===
+                gpio_hold_dis((gpio_num_t)LCD_BL);
+                gpio_hold_dis((gpio_num_t)BUZZER_PIN);
+                gpio_hold_dis((gpio_num_t)LCD_CS);
                 setCpuFrequencyMhz(240);
                 g_screenSleeping = false;
                 g_screenDimmed = false;
@@ -321,7 +363,7 @@ void renderTask(void* pvParameters) {
             lastFpsReport = now;
         }
         
-        // VRR动态帧率：根据状态调整延迟
+        // VRR动态帧率：根据屏幕状态+Agent状态调整（OTLP联动）
         uint32_t frameDelay = 20;  // ACTIVE: 50fps
         if (g_screenSleeping) {
             frameDelay = 500;       // SLEEP: 2fps
@@ -329,6 +371,16 @@ void renderTask(void* pvParameters) {
             frameDelay = 1000;      // DIM: 1fps
         } else if (millis() - g_lastDataReceived > SCREEN_DIM_TIMEOUT / 2) {
             frameDelay = 200;       // IDLE: 5fps (数据静默>15秒)
+        } else {
+            // OTLP联动：根据Agent状态微调帧率
+            int backIdx = 1 - g_frontIdx.load(std::memory_order_acquire);
+            uint8_t agentStatus = g_displayBuf[backIdx].agent.status;
+            if (agentStatus == STATUS_WORKING) {
+                frameDelay = 16;    // Agent工作中: 60fps (流畅思考动画)
+            } else if (agentStatus == STATUS_AUTH) {
+                frameDelay = 33;    // 认证/交互: 30fps
+            }
+            // STATUS_IDLE/STATUS_OFFLINE: 保持默认50fps
         }
         
         // 触摸检测
@@ -551,34 +603,40 @@ void parseServerData(String json) {
         }
     }
     else if (type == "pixel_data") {
-        // 流式解析：用小StaticJsonDocument仅解析chunk/last，手动提取base64指针避免大buffer拷贝
-        // 检查数据完整性
-        const char* dataField = strstr(json.c_str(), "\"data\":\"");
-        const char* chunkField = strstr(json.c_str(), "\"chunk\":");
-        const char* lastField = strstr(json.c_str(), "\"last\":");
-        if (!dataField || !chunkField) { Serial.println("[Main] Pixel: missing data/chunk field"); return; }
-
-        // 小JSON文档只解析chunk和last（两个整数字段，极小内存）
-        StaticJsonDocument<256> metaDoc;
-        // 截取chunk/last部分：找到"data"字段起始，用其位置作为JSON结束
-        const char* dataKey = strstr(json.c_str(), "\"data\"");
-        if (!dataKey) return;
-        // 在"data"键之前截断，仅解析chunk和last
-        size_t prefixLen = dataKey - json.c_str();
-        char prefixBuf[prefixLen + 1];
-        memcpy(prefixBuf, json.c_str(), prefixLen);
-        prefixBuf[prefixLen] = '\0';
-        DeserializationError error = deserializeJson(metaDoc, prefixBuf);
-        if (error) { Serial.printf("[Main] Pixel meta parse error: %s\n", error.c_str()); return; }
-
-        int chunkIndex = metaDoc["chunk"] | 0;
-        bool isLastChunk = metaDoc["last"] | false;
-
-        // 手动提取base64数据指针（避免拷贝到String/JsonDocument）
-        const char* dataStart = dataField + 8; // 跳过 "data":"
-        const char* dataEnd = strchr(dataStart, '"');
-        if (!dataEnd) { Serial.println("[Main] Pixel: malformed data field"); return; }
-        size_t b64Len = dataEnd - dataStart;
+        // 流式解析：兼容两种协议格式
+        // 格式A (pxl_sender): {"type":"pixel_data","data":{"packet_index":0,"total_packets":N,"chunk_base64":"..."},"ts":...}
+        // 格式B (legacy): {"type":"pixel_data","data":"base64","chunk":0,"last":false,"ts":...}
+        
+        // 用完整JSON解析，兼容嵌套对象和简单字符串
+        StaticJsonDocument<1536> pixelDoc;
+        DeserializationError err = deserializeJson(pixelDoc, json);
+        if (err) { Serial.printf("[Main] Pixel JSON parse error: %s\n", err.c_str()); return; }
+        
+        JsonObject dataObj = pixelDoc["data"];
+        int chunkIndex = 0;
+        bool isLastChunk = false;
+        const char* b64Data = nullptr;
+        size_t b64Len = 0;
+        
+        if (dataObj.containsKey("packet_index")) {
+            // 格式A: data是嵌套对象（pxl_sender发送）
+            chunkIndex = dataObj["packet_index"] | 0;
+            int totalPackets = dataObj["total_packets"] | 1;
+            isLastChunk = (chunkIndex == totalPackets - 1);
+            b64Data = dataObj["chunk_base64"] | "";
+            b64Len = strlen(b64Data);
+        } else if (dataObj.is<const char*>()) {
+            // 格式B: data直接是base64字符串（legacy格式）
+            chunkIndex = pixelDoc["chunk"] | 0;
+            isLastChunk = pixelDoc["last"] | false;
+            b64Data = dataObj.as<const char*>();
+            b64Len = strlen(b64Data);
+        } else {
+            Serial.println("[Main] Pixel: unknown data format");
+            return;
+        }
+        
+        if (!b64Data || b64Len == 0) { Serial.println("[Main] Pixel: empty base64 data"); return; }
 
         if (chunkIndex == 0) {
             g_pxlBuffer = g_pxlPool;
@@ -600,7 +658,7 @@ void parseServerData(String json) {
         int ret = mbedtls_base64_decode(g_pxlBuffer + g_pxlOffset,
                                         g_pxlCapacity - g_pxlOffset,
                                         &written,
-                                        (const unsigned char*)dataStart,
+                                        (const unsigned char*)b64Data,
                                         b64Len);
         if (ret != 0) {
             Serial.printf("[Main] Pixel: base64 decode error %d (chunk %d)\n", ret, chunkIndex);

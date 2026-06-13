@@ -40,6 +40,8 @@ static constexpr uint8_t REG_FEEDBACK  = 0x1A;
 static constexpr uint8_t REG_CONTROL1  = 0x1B;
 static constexpr uint8_t REG_CONTROL2  = 0x1C;
 static constexpr uint8_t REG_CONTROL3  = 0x1D;
+static constexpr uint8_t REG_RATEDVOL = 0x16;
+static constexpr uint8_t REG_ODCLAMP  = 0x17;
 
 // 模式值
 static constexpr uint8_t MODE_INTERNAL = 0x00;
@@ -89,7 +91,73 @@ bool HapticDriver::begin(int sdaPin, int sclPin) {
     
     _available = true;
     Serial.println("[Haptic] DRV2605L initialized (LRA mode, Library 6)");
+    
+    // 自动校准LRA参数
+    calibrate();
+    
+    // 校准后重新配置工作模式
+    _writeRegister(REG_MODE, MODE_INTERNAL);
+    _writeRegister(REG_LIBRARY, 0x06);  // Library 6 for LRA
+    _writeRegister(REG_CONTROL1, 0x93);
+    _writeRegister(REG_CONTROL2, 0xF5);
+    _writeRegister(REG_CONTROL3, 0xA0);
+    
+    Serial.println("[Haptic] Ready for playback");
     return true;
+}
+
+
+// ====== 自动校准 ======
+
+bool HapticDriver::calibrate() {
+    if (!_available) return false;
+
+    // Step 1: 设置为待机模式
+    _writeRegister(REG_MODE, 0x00);  // Internal Trigger mode (standby)
+    delay(10);
+
+    // Step 2: 配置LRA参数（校准前必须正确设置）
+    // 额定电压: 对于LRA，典型值约1.8V RMS
+    // DRV2605L: RatedVoltage = V_rms * 255 / 5.36V
+    // 1.8V → ~85 (0x55)
+    _writeRegister(REG_RATEDVOL, 0x55);
+
+    // 过驱动钳位: 典型值约2.5V peak
+    // ODClamp = V_peak * 255 / 5.6V
+    // 2.5V → ~114 (0x72)
+    _writeRegister(REG_ODCLAMP, 0x72);
+
+    // Step 3: 设置Feedback寄存器 (LRA模式 + back-EMF使能)
+    // [7]=1(LRA), [6:4]=0(不修改采样时间), [3]=0(自动补偿)
+    _writeRegister(REG_FEEDBACK, 0xA0);
+
+    // Step 4: 设置Control2 (校准时使用默认参数)
+    _writeRegister(REG_CONTROL2, 0xF5);
+
+    // Step 5: 进入自动校准模式 (Mode=0x07)
+    _writeRegister(REG_MODE, 0x07);
+
+    // Step 6: 触发校准
+    _writeRegister(REG_GO, 0x01);
+
+    // Step 7: 等待校准完成 (GO位自动清零)
+    unsigned long start = millis();
+    while (millis() - start < 1500) {  // 最多等1.5秒
+        uint8_t go = _readRegister(REG_GO);
+        if ((go & 0x01) == 0) {
+            // 校准完成，读取诊断结果
+            uint8_t diag = _readRegister(REG_STATUS);
+            Serial.printf("[Haptic] Calibration done. Status=0x%02X (0x00=OK)
+", diag);
+            _available = true;
+            return true;
+        }
+        delay(50);
+    }
+
+    Serial.println("[Haptic] Calibration TIMEOUT (>1500ms)");
+    _available = false;
+    return false;
 }
 
 // ====== 效果播放 ======

@@ -68,6 +68,10 @@ private:
     bool _available;
     int16_t _lastLux;
     unsigned long _lastReadTime;
+    
+    // EMA滤波参数（指数移动平均）
+    float _emaLux;           // EMA滤波后的lux值
+    static constexpr float EMA_ALPHA = 0.15f;  // 平滑系数（0.0~1.0，越小越平滑）
 
     bool _writeCommand(uint8_t cmd);
     int16_t _readRawValue();
