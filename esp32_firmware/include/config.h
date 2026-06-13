@@ -31,6 +31,13 @@
 #define LCD_MOSI  11
 #define LCD_SCLK  12
 #define LCD_BL    48
+// V-Sync TE引脚 (ST7789V Tearing Effect Output)
+// 硬件接线: ESP32 GPIO → ST7789V TE引脚 (需要确认硬件原理图)
+// 目前使用软件帧率控制，TE引脚就绪后切换到硬件V-Sync
+#define LCD_TE_PIN          -1     // -1=禁用(软件帧率), 接线后改为实际GPIO
+#define TE_ACTIVE_HIGH      true   // TE信号极性: true=上升沿有效
+#define VSYNC_TIMEOUT_MS    20     // 等待V-Sync超时(ms)
+
 #define LCD_MISO  13
 
 // 屏幕参数

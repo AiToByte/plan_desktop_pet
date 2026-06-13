@@ -213,6 +213,18 @@ private:
     // 文字色
     static const uint16_t COLOR_TEXT     = 0xFFFF;  // 白色
     static const uint16_t COLOR_TEXT_DIM = 0xC618;  // 暗灰
+
+    // === V-Sync TE同步 ===
+    // 当LCD_TE_PIN >= 0时启用硬件TE中断同步
+    // 当LCD_TE_PIN == -1时使用软件自适应帧率控制
+    volatile bool _teReceived = false;
+    static void IRAM_ATTR _teIsrHandler(void* arg);
+    void waitForVSync();
+    void setupVSync();
+    unsigned long _lastFrameTime = 0;  // 软件帧率控制 fallback
+    unsigned long _frameIntervalMs = 33; // 目标帧间隔 (~30fps)
 };
+
+
 
 #endif // DISPLAY_MANAGER_H

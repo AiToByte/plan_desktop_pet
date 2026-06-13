@@ -161,7 +161,18 @@ void commTask(void* pvParameters) {
         vTaskDelay(pdMS_TO_TICKS(10));  // 让出CPU，避免看门狗超时
     }
 
-    else if (type == "thinking_status") {
+    else if (type == "ping") {
+        // 应用层Ping/Pong心跳回应
+        StaticJsonDocument<128> pong;
+        pong["type"] = "pong";
+        pong["ts"] = millis();
+        pong["ping_ts"] = doc["ts"] | 0;
+        String pongJson;
+        serializeJson(pong, pongJson);
+        comm.sendFramed(pongJson);
+        Serial.println("[Comm] Pong sent");
+    }
+        else if (type == "thinking_status") {
         // 思考链状态 (from OTLP ThinkingChainTracker)
         StaticJsonDocument<256> filter;
         filter["type"] = true;

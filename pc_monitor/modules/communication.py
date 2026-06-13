@@ -9,6 +9,8 @@ import time
 import logging
 import threading
 from typing import Callable, Optional
+from queue import Queue, Empty
+import struct
 from dataclasses import dataclass, field
 
 # 默认配置常量
@@ -29,6 +31,11 @@ ERROR_RECOVERY_DELAY = 0.1
 BROADCAST_SLEEP_STEP = 0.1
 RECV_BUFFER_SIZE = 4096
 MDNS_HOSTNAME = "deskpet.local"
+# Keep-Alive 配置
+KEEPALIVE_INTERVAL = 10    # 每10秒发送ping
+KEEPALIVE_TIMEOUT = 30     # 30秒无pong视为断连
+SEND_QUEUE_MAXSIZE = 64    # 异步发送队列最大容量
+
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +230,13 @@ class WiFiCommunication(CommunicationBase):
         self._read_thread: Optional[threading.Thread] = None
         self._udp_broadcast_thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
+        
+        # 异步发送队列 + 保活
+        self._send_queue: Queue = Queue(maxsize=SEND_QUEUE_MAXSIZE)
+        self._send_worker_thread: Optional[threading.Thread] = None
+        self._keepalive_thread: Optional[threading.Thread] = None
+        self._last_pong_time: float = 0
+        self._ping_pending: bool = False
     
     @staticmethod
     def resolve_mdns(hostname: str = MDNS_HOSTNAME) -> Optional[str]:
@@ -258,6 +272,16 @@ class WiFiCommunication(CommunicationBase):
             self._udp_broadcast_thread.start()
             
             logger.info(f"TCP Server 已启动，监听 {self.host}:{self.port}，UDP广播端口 {self.udp_broadcast_port}")
+            
+            # 启动异步发送队列worker
+            self._send_worker_thread = threading.Thread(target=self._send_queue_worker, daemon=True)
+            self._send_worker_thread.start()
+            
+            # 启动Keep-Alive线程
+            self._last_pong_time = time.time()
+            self._keepalive_thread = threading.Thread(target=self._keepalive_loop, daemon=True)
+            self._keepalive_thread.start()
+            
             return True
             
         except Exception as e:
@@ -396,8 +420,47 @@ class WiFiCommunication(CommunicationBase):
                     time.sleep(self._reconnect_delay)
                 return False
     
+
+    def _send_queue_worker(self):
+        """后台worker：从队列取消息并同步发送"""
+        while self._running:
+            try:
+                msg = self._send_queue.get(timeout=0.5)
+                self._flush_send(msg)
+            except Empty:
+                continue
+            except Exception as e:
+                logger.error(f"发送worker错误: {e}")
+                time.sleep(0.1)
+    
+    def _keepalive_loop(self):
+        """Keep-Alive心跳：定期发送ping，超时无pong则断连"""
+        while self._running:
+            time.sleep(KEEPALIVE_INTERVAL)
+            if not self._running or not self._connected:
+                break
+            
+            now = time.time()
+            # 检查pong超时
+            if self._last_pong_time > 0 and (now - self._last_pong_time) > KEEPALIVE_TIMEOUT:
+                logger.warning(f"Keep-Alive超时({KEEPALIVE_TIMEOUT}s无pong)，断开连接")
+                with self._lock:
+                    if self._client_socket:
+                        try: self._client_socket.close()
+                        except Exception: pass
+                        self._client_socket = None
+                    self._connected = False
+                break
+            
+            # 发送ping
+            try:
+                ping_msg = DeviceMessage(msg_type="ping", data={}, timestamp=time.time())
+                self._flush_send(ping_msg)
+                self._ping_pending = True
+            except Exception as e:
+                logger.warning(f"Keep-Alive ping失败: {e}")
+
     def _read_loop(self):
-        """读取客户端数据循环（支持长度前缀帧 + 旧格式fallback）"""
         buffer = ""
         expected_len = None
         payload_buf = ""
@@ -460,11 +523,19 @@ class WiFiCommunication(CommunicationBase):
                 break
     
     def _process_received(self, data: str):
-        """处理接收到的数据"""
+        """处理接收到的数据（含pong心跳响应处理）"""
         try:
             msg_data = json.loads(data)
+            msg_type = msg_data.get("type", "unknown")
+            
+            # 处理pong心跳响应
+            if msg_type == "pong":
+                self._last_pong_time = time.time()
+                self._ping_pending = False
+                return  # pong不传递给上层回调
+            
             msg = DeviceMessage(
-                msg_type=msg_data.get("type", "unknown"),
+                msg_type=msg_type,
                 data=msg_data.get("data", {}),
                 timestamp=msg_data.get("ts", time.time())
             )

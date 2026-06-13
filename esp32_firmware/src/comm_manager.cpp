@@ -121,88 +121,89 @@ void CommManager::update() {
         for (size_t i = 0; i < bytesRead; i++) {
             char c = _readBuf[i];
         
-        switch (_frameState) {
-            case FRAME_IDLE:
-                // 检测帧类型：'L' = 长度前缀, '{' = 旧格式JSON
-                if (c == 'L') {
-                    _lenBuffer = "L";
-                    _frameState = FRAME_READ_LEN;
-                } else if (c == '{') {
-                    // 旧格式fallback：整行是一个JSON
-                    _frameBuffer = "{";
-                    _frameState = FRAME_LEGACY_LINE;
-                }
-                // 其他字符（空白等）跳过
-                break;
-                
-            case FRAME_READ_LEN:
-                // 累积到换行符：期望格式 "EN:NNNN\n"
-                if (c == '\n') {
-                    // 解析 "LEN:NNNN" → "L" + "EN:NNNN"
-                    // _lenBuffer = "LEN:NNNN"
-                    if (_lenBuffer.startsWith("LEN:")) {
-                        _expectedLen = atoi(_lenBuffer.substring(4).c_str());
-                        if (_expectedLen > 0 && _expectedLen < 256 * 1024) {
-                            _frameBuffer = "";
-                            _frameBuffer.reserve(_expectedLen);
-                            _frameState = FRAME_READ_BODY;
-                            Serial.printf("[Comm] Frame len=%d\n", _expectedLen);
+            switch (_frameState) {
+                case FRAME_IDLE:
+                    // 检测帧类型：'L' = 长度前缀, '{' = 旧格式JSON
+                    if (c == 'L') {
+                        _lenBuffer = "L";
+                        _frameState = FRAME_READ_LEN;
+                    } else if (c == '{') {
+                        // 旧格式fallback：整行是一个JSON
+                        _frameBuffer = "{";
+                        _frameState = FRAME_LEGACY_LINE;
+                    }
+                    // 其他字符（空白等）跳过
+                    break;
+                    
+                case FRAME_READ_LEN:
+                    // 累积到换行符：期望格式 "EN:NNNN\n"
+                    if (c == '\n') {
+                        // 解析 "LEN:NNNN"
+                        if (_lenBuffer.startsWith("LEN:")) {
+                            _expectedLen = atoi(_lenBuffer.substring(4).c_str());
+                            if (_expectedLen > 0 && _expectedLen < 256 * 1024) {
+                                _frameBuffer = "";
+                                _frameBuffer.reserve(_expectedLen);
+                                _frameState = FRAME_READ_BODY;
+                                Serial.printf("[Comm] Frame len=%d\n", _expectedLen);
+                            } else {
+                                Serial.printf("[Comm] Invalid len: %s\n", _lenBuffer.c_str());
+                                _frameState = FRAME_IDLE;
+                            }
                         } else {
-                            Serial.printf("[Comm] Invalid len: %s\n", _lenBuffer.c_str());
+                            Serial.printf("[Comm] Bad header: %s\n", _lenBuffer.c_str());
                             _frameState = FRAME_IDLE;
                         }
-                    } else {
-                        Serial.printf("[Comm] Bad header: %s\n", _lenBuffer.c_str());
-                        _frameState = FRAME_IDLE;
-                    }
-                    _lenBuffer = "";
-                } else {
-                    _lenBuffer += c;
-                    // 防止超长header攻击
-                    if (_lenBuffer.length() > 16) {
-                        Serial.println("[Comm] Header overflow, reset");
                         _lenBuffer = "";
+                    } else {
+                        _lenBuffer += c;
+                        // 防止超长header攻击
+                        if (_lenBuffer.length() > 16) {
+                            Serial.println("[Comm] Header overflow, reset");
+                            _lenBuffer = "";
+                            _frameState = FRAME_IDLE;
+                        }
+                    }
+                    break;
+                    
+                case FRAME_READ_BODY:
+                    _frameBuffer += c;
+                    if ((int)_frameBuffer.length() >= _expectedLen) {
+                        // 完整帧到达
+                        processData(_frameBuffer);
+                        _frameBuffer = "";
+                        _expectedLen = 0;
                         _frameState = FRAME_IDLE;
                     }
-                }
-                break;
-                
-            case FRAME_READ_BODY:
-                _frameBuffer += c;
-                if ((int)_frameBuffer.length() >= _expectedLen) {
-                    // 完整帧到达
-                    processData(_frameBuffer);
-                    _frameBuffer = "";
-                    _expectedLen = 0;
-                    _frameState = FRAME_IDLE;
-                }
-                break;
-                
-            case FRAME_LEGACY_LINE:
-                if (c == '\n') {
-                    processData(_frameBuffer);
-                    _frameBuffer = "";
-                    _frameState = FRAME_IDLE;
-                } else {
-                    _frameBuffer += c;
-                    // 防止单帧过大（旧格式无长度保护）
-                    if (_frameBuffer.length() > 32 * 1024) {
-                        Serial.println("[Comm] Legacy frame overflow, reset");
+                    break;
+                    
+                case FRAME_LEGACY_LINE:
+                    if (c == '\n') {
+                        processData(_frameBuffer);
                         _frameBuffer = "";
                         _frameState = FRAME_IDLE;
+                    } else {
+                        _frameBuffer += c;
+                        // 防止单帧过大（旧格式无长度保护）
+                        if (_frameBuffer.length() > 32 * 1024) {
+                            Serial.println("[Comm] Legacy frame overflow, reset");
+                            _frameBuffer = "";
+                            _frameState = FRAME_IDLE;
+                        }
                     }
-                }
-                break;
-        }
-    }
+                    break;
+            }  // switch
+        }  // for
+    }  // while
     
     // 检查连接状态
     if (!_client.connected()) {
         Serial.println("[Comm] Connection lost!");
         _connected = false;
+        // 断连后启用WiFi省电模式，降低RF功耗
+        WiFi.setSleep(true);
     }
 }
-
 void CommManager::processData(const String& data_) {
     String data = data_;
     data.trim();

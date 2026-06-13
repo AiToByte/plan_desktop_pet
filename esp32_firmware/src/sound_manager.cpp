@@ -193,26 +193,50 @@ void SoundManager::_initI2S() {
 void SoundManager::_i2sTone(uint16_t freq, uint16_t duration) {
     if (!_i2sInitialized) return;
     
-    // 生成正弦波DMA缓冲区
+    // 生成正弦波基础缓冲区
     const int samplesPerCycle = 44100 / freq;
     const int bufLen = (samplesPerCycle > 256) ? 256 : samplesPerCycle;
-    uint8_t buf[256];
+    uint8_t baseBuf[256];
+    uint8_t envBuf[256];
     
     for (int i = 0; i < bufLen; i++) {
-        // 8-bit正弦波 (128 = 中心值，振幅120)
         float angle = 2.0f * 3.14159f * i / bufLen;
-        buf[i] = (uint8_t)(128 + 120 * sinf(angle));
+        baseBuf[i] = (uint8_t)(128 + 120 * sinf(angle));
     }
+    
+    // ADSR参数 (单位: ms)
+    const uint16_t attackMs  = 8;   // 淡入 (最小瞬态)
+    const uint16_t decayMs   = 0;   // 无衰减(纯正弦不需要)
+    const uint16_t releaseMs = 15;  // 淡出 (消除断尾爆音)
+    unsigned long now = millis();
+    unsigned long endTime = now + duration;
+    unsigned long releaseStart = endTime - releaseMs;
     
     size_t bytesWritten = 0;
-    unsigned long endTime = millis() + duration;
     while (millis() < endTime) {
-        i2s_write(I2S_NUM_0, buf, bufLen, &bytesWritten, portMAX_DELAY);
+        // 计算当前包络增益 (0.0 ~ 1.0)
+        unsigned long t = millis();
+        float gain = 1.0f;
+        if (t - now < attackMs) {
+            // Attack阶段: 线性淡入
+            gain = (float)(t - now) / (float)attackMs;
+        } else if (t >= releaseStart && t < endTime) {
+            // Release阶段: 线性淡出
+            gain = (float)(endTime - t) / (float)releaseMs;
+        }
+        
+        // 应用包络到正弦波
+        for (int i = 0; i < bufLen; i++) {
+            float sample = (baseBuf[i] - 128) * gain;
+            envBuf[i] = (uint8_t)(128 + (int8_t)sample);
+        }
+        
+        i2s_write(I2S_NUM_0, envBuf, bufLen, &bytesWritten, portMAX_DELAY);
     }
     
-    // 静音
-    memset(buf, 128, bufLen);
-    i2s_write(I2S_NUM_0, buf, bufLen, &bytesWritten, portMAX_DELAY);
+    // 额外写一小段静音，确保DMA缓冲区清空
+    memset(envBuf, 128, bufLen);
+    i2s_write(I2S_NUM_0, envBuf, bufLen, &bytesWritten, portMAX_DELAY);
 }
 
 void SoundManager::setAudioMode(AudioMode mode) {
