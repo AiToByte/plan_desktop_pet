@@ -20,6 +20,7 @@ from modules.token_stats import TokenTracker
 from modules.weather import WeatherService
 from modules.communication import create_communication, DeviceMessage
 from modules.otlp_receiver import OTLPReceiver
+from tray_app import TrayApp
 
 # 配置日志
 logging.basicConfig(
@@ -76,6 +77,7 @@ class DesktopPetMonitor:
         # 定时器记录
         self._last_token_update = 0.0
         self._last_weather_update = 0.0
+        self._tray_app = None  # 托盘应用引用
         
     def _load_config(self, config_path: str) -> Dict[str, Any]:
         """加载配置文件"""
@@ -157,6 +159,12 @@ class DesktopPetMonitor:
         )
         
         self.communication.send_message(msg)
+        self._forward_to_tray({
+            'status': state.status.value,
+            'cpu': round(state.cpu_percent, 1),
+            'mem': round(state.memory_mb, 1),
+            'uptime': int(state.uptime_seconds),
+        })
         logger.info(f"状态已发送: {state.status.value}")
     
     def _send_weather_update(self) -> None:
@@ -201,8 +209,25 @@ class DesktopPetMonitor:
         )
         
         self.communication.send_message(msg)
+        self._forward_to_tray({
+            'input_tokens': stats.total_input_tokens,
+            'output_tokens': stats.total_output_tokens,
+            'requests': stats.total_requests,
+        })
         logger.info(f"Token统计已发送: {stats.total_requests} 次请求")
     
+    def set_tray_app(self, tray_app) -> None:
+        """设置托盘应用引用，用于实时推送指标"""
+        self._tray_app = tray_app
+
+    def _forward_to_tray(self, data: dict) -> None:
+        """将指标数据转发给托盘面板"""
+        if self._tray_app:
+            try:
+                self._tray_app.update_metrics(data)
+            except Exception as e:
+                logger.debug(f"Tray update error: {e}")
+
     def _periodic_update(self) -> None:
         """定时更新任务"""
         update_interval = self.config.get("display", {}).get("update_interval", 5)
@@ -323,25 +348,71 @@ class DesktopPetMonitor:
             logger.debug(f"OTLP转发: {span.name} → {device_status}")
 
 
+def _simulate_tray(app: TrayApp) -> None:
+    """模拟数据（仅 --tray-only 调试模式）"""
+    import random
+    while True:
+        app.update_metrics({
+            'status': random.choice(['Idle', 'Working', 'Auth']),
+            'cpu': random.uniform(5, 80),
+            'mem': random.uniform(100, 500),
+            'uptime': f"{random.randint(0, 24)}h {random.randint(0, 59)}m",
+            'crash_count': 0,
+            'input_tokens': random.randint(100, 2000),
+            'output_tokens': random.randint(50, 800),
+        })
+        time.sleep(2)
+
+
 def main() -> None:
     """主函数"""
-    # 设置工作目录
+    import argparse
+    parser = argparse.ArgumentParser(description="ESP32 桌面宠物 PC监控程序")
+    parser.add_argument('--tray', action='store_true', help='启动系统托盘GUI面板')
+    parser.add_argument('--tray-only', action='store_true', help='仅启动托盘面板（模拟数据调试模式）')
+    args = parser.parse_args()
+
     os.chdir(Path(__file__).parent)
-    
-    # 信号处理
+
+    # --tray-only: 仅启动托盘（调试用）
+    if args.tray_only:
+        app = TrayApp()
+        threading.Thread(target=lambda: _simulate_tray(app), daemon=True).start()
+        app.run()
+        return
+
     monitor = DesktopPetMonitor()
-    
+
     def signal_handler(sig: int, frame: Any) -> None:
         logger.info(f"收到信号 {sig}")
         monitor.stop()
         sys.exit(0)
-    
+
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    
-    # 启动监控
-    success = monitor.start()
-    sys.exit(0 if success else 1)
+
+    if args.tray:
+        # 托盘模式：后台监控 + 前台GUI
+        if not monitor.communication.connect():
+            logger.error("无法连接到ESP32设备")
+            sys.exit(1)
+        monitor.communication.set_message_callback(monitor._on_device_message)
+        monitor.running = True
+        monitor._otlp_receiver.start()
+
+        app = TrayApp(on_exit_callback=lambda: (setattr(monitor, 'running', False), monitor.stop()))
+        monitor.set_tray_app(app)
+
+        update_thread = threading.Thread(target=monitor._periodic_update, daemon=True)
+        update_thread.start()
+        logger.info("监控+托盘GUI已启动")
+
+        app.run()  # 主线程tkinter事件循环
+        monitor.stop()
+    else:
+        # 纯命令行模式
+        success = monitor.start()
+        sys.exit(0 if success else 1)
 
 
 if __name__ == "__main__":

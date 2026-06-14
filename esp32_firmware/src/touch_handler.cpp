@@ -28,11 +28,11 @@ bool ProximitySensor::update() {
     _fastEMA = PROX_EMA_FAST_ALPHA * raw + (1.0f - PROX_EMA_FAST_ALPHA) * _fastEMA;
     _slowEMA = PROX_EMA_SLOW_ALPHA * raw + (1.0f - PROX_EMA_SLOW_ALPHA) * _slowEMA;
     
-    float diff = _fastEMA - _slowEMA;
+    float diff = _slowEMA - _fastEMA;  // 慢线(基准)减快线(即时)，接近时raw下降→fastEMA降更快→diff为正
     unsigned long now = millis();
     
     if (!_isNear) {
-        // 等待上升沿（手指接近时电容值上升）
+        // 等待上升沿（手指接近时touchRead值下降，diff变正）
         if (diff > PROX_RISING_THRESHOLD) {
             _isNear = true;
             _lastNearTime = now;
@@ -43,7 +43,7 @@ bool ProximitySensor::update() {
             }
         }
     } else {
-        // 等待下降沿（手指远离）
+        // 等待下降沿（手指远离时diff回落到基线以下）
         if (diff < PROX_FALLING_THRESHOLD) {
             _isNear = false;
         }

@@ -158,8 +158,59 @@ void SoundManager::_stopSineTimer() {
 
 // ====== I2S-PDM 音频后端 (ESP32-S3专用) ======
 #if SOUND_I2S_PDM_ENABLED
+// ESP-IDF v5.x 提供 <driver/i2s_pdm.h> 新API；v4.x 使用旧 i2s_config_t API
+#if __has_include(<driver/i2s_pdm.h>)
+// ========== ESP-IDF v5.x / Arduino-ESP32 v3.x 新API ==========
+#include <driver/i2s_pdm.h>
+
+static i2s_chan_handle_t s_i2sTxChan = nullptr;
+
 void SoundManager::_initI2S() {
-    // I2S配置: PDM TX模式，单声道，8-bit分辨率
+    // 创建I2S通道（PDM TX模式）
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    chan_cfg.dma_desc_num = 4;
+    chan_cfg.dma_frame_num = 256;
+
+    esp_err_t err = i2s_new_channel(&chan_cfg, &s_i2sTxChan, nullptr);
+    if (err != ESP_OK) {
+        Serial.printf("[Sound] I2S new_channel failed: %d\n", err);
+        _audioMode = AUDIO_PWM;
+        return;
+    }
+
+    // PDM TX配置（单声道，8-bit，44.1kHz）
+    i2s_pdm_tx_config_t pdm_cfg = {};
+    pdm_cfg.clk_cfg = I2S_PDM_TX_CLK_DEFAULT_CONFIG(44100);
+    pdm_cfg.slot_cfg = I2S_PDM_TX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_8BIT, I2S_SLOT_MODE_MONO);
+    pdm_cfg.gpio_cfg.clk = I2S_GPIO_UNUSED;
+    pdm_cfg.gpio_cfg.dout = (gpio_num_t)BUZZER_PIN;
+    pdm_cfg.gpio_cfg.invert_flags.clk_inv = false;
+
+    err = i2s_channel_init_pdm_tx_mode(s_i2sTxChan, &pdm_cfg);
+    if (err != ESP_OK) {
+        Serial.printf("[Sound] I2S PDM TX init failed: %d\n", err);
+        i2s_del_channel(s_i2sTxChan);
+        s_i2sTxChan = nullptr;
+        _audioMode = AUDIO_PWM;
+        return;
+    }
+
+    err = i2s_channel_enable(s_i2sTxChan);
+    if (err != ESP_OK) {
+        Serial.printf("[Sound] I2S channel enable failed: %d\n", err);
+        i2s_del_channel(s_i2sTxChan);
+        s_i2sTxChan = nullptr;
+        _audioMode = AUDIO_PWM;
+        return;
+    }
+
+    _i2sInitialized = true;
+    Serial.println("[Sound] I2S-PDM v5.x initialized on GPIO " + String(BUZZER_PIN));
+}
+
+#else
+// ========== ESP-IDF v4.x / Arduino-ESP32 v2.x 旧API ==========
+void SoundManager::_initI2S() {
     i2s_config_t i2s_config = {};
     i2s_config.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_PDM);
     i2s_config.sample_rate = 44100;
@@ -187,8 +238,9 @@ void SoundManager::_initI2S() {
     i2s_set_pin(I2S_NUM_0, &pin_config);
     i2s_set_clk(I2S_NUM_0, 44100, I2S_BITS_PER_SAMPLE_8BIT, I2S_CHANNEL_MONO);
     _i2sInitialized = true;
-    Serial.println("[Sound] I2S-PDM initialized on GPIO " + String(BUZZER_PIN));
+    Serial.println("[Sound] I2S-PDM v4.x initialized on GPIO " + String(BUZZER_PIN));
 }
+#endif  // __has_include(<driver/i2s_pdm.h>)
 
 void SoundManager::_i2sTone(uint16_t freq, uint16_t duration) {
     if (!_i2sInitialized) return;

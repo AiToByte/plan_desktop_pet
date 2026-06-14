@@ -7,6 +7,12 @@
 #include <math.h>
 #include <time.h>
 
+// ============ SRAM切片缓冲（用于分块传输） ============
+static uint16_t s_sramSliceBuf[512] __attribute__((aligned(4))) __attribute__((section(".dram")));
+static bool s_sramInited = false;
+static uint16_t s_sramBufW = 0;
+static uint16_t s_sramBufH = 0;
+
 // ============ 构造 / 初始化 ============
 
 DisplayManager::DisplayManager()
@@ -1075,16 +1081,20 @@ void DisplayManager::setupVSync() {
     // 初始化TE中断引脚(需在display init之后调用)
     // ST7789V2 TE引脚默认输出模式，frame scan期间为LOW
     // 注: 需先通过SPI命令0x35启用TE output line
-    pinMode(TE_PIN, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(TE_PIN), _teIsrHandler, FALLING);
+    if (LCD_TE_PIN < 0) {
+        Serial.println("[Display] V-Sync disabled (LCD_TE_PIN < 0)");
+        return;
+    }
+    pinMode(LCD_TE_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(LCD_TE_PIN), _teIsrHandler, FALLING);
     s_teTriggered = false;
-    Serial.printf("[Display] V-Sync TE interrupt on GPIO %d\n", TE_PIN);
+    Serial.printf("[Display] V-Sync TE interrupt configured on GPIO %d\n", LCD_TE_PIN);
 }
 
 void DisplayManager::waitForVSync(uint32_t timeout_ms) {
     // 阻塞等待TE中断(下一帧扫描开始)
     // 如果TE未初始化或超时，直接返回(非阻塞退化)
-    if (!digitalPinIsValid(TE_PIN)) return;
+    if (LCD_TE_PIN < 0 || !digitalPinIsValid(LCD_TE_PIN)) return;
     
     s_teTriggered = false;
     unsigned long start = millis();

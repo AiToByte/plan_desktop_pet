@@ -665,28 +665,42 @@ void parseServerData(String json) {
         }
     }
     else if (type == "pixel_data") {
-        // 流式解析：兼容两种协议格式
+        // 流式解析：兼容两种协议格式（零拷贝优化版）
         // 格式A (pxl_sender): {"type":"pixel_data","data":{"packet_index":0,"total_packets":N,"chunk_base64":"..."},"ts":...}
         // 格式B (legacy): {"type":"pixel_data","data":"base64","chunk":0,"last":false,"ts":...}
         
-        // 用完整JSON解析，兼容嵌套对象和简单字符串
-        StaticJsonDocument<1536> pixelDoc;
-        DeserializationError err = deserializeJson(pixelDoc, json);
-        if (err) { Serial.printf("[Main] Pixel JSON parse error: %s\n", err.c_str()); return; }
-        
+        // 拷贝一份可写字符数组以启用 ArduinoJson 的零拷贝（In-place）解析
+        int jsonLen = json.length();
+        char* writeableBuf = (char*)malloc(jsonLen + 1);
+        if (!writeableBuf) {
+            Serial.println("[Main] Failed to alloc temp writeable buf for pixel_data");
+            return;
+        }
+        memcpy(writeableBuf, json.c_str(), jsonLen + 1);
+
+        // 启用零拷贝解析，256字节容量已绰绰有余（字符串直接指向writeableBuf）
+        StaticJsonDocument<256> pixelDoc;
+        DeserializationError err = deserializeJson(pixelDoc, writeableBuf);
+        if (err) {
+            Serial.printf("[Main] Pixel JSON parse error: %s\n", err.c_str());
+            free(writeableBuf);
+            return;
+        }
+
         JsonObject dataObj = pixelDoc["data"];
         int chunkIndex = 0;
         bool isLastChunk = false;
         const char* b64Data = nullptr;
         size_t b64Len = 0;
-        
-        if (dataObj.containsKey("packet_index")) {
-            // 格式A: data是嵌套对象（pxl_sender发送）
-            chunkIndex = dataObj["packet_index"] | 0;
-            int totalPackets = dataObj["total_packets"] | 1;
-            isLastChunk = (chunkIndex == totalPackets - 1);
-            b64Data = dataObj["chunk_base64"] | "";
-            b64Len = strlen(b64Data);
+
+        if (dataObj.is<JsonObject>()) {
+            // 格式A: data是对象，含packet_index/total_packets/chunk_base64
+            JsonObject dataMap = dataObj.as<JsonObject>();
+            chunkIndex = dataMap["packet_index"] | 0;
+            int totalPackets = dataMap["total_packets"] | 1;
+            isLastChunk = (chunkIndex >= totalPackets - 1);
+            b64Data = dataMap["chunk_base64"] | (const char*)nullptr;
+            if (b64Data) b64Len = strlen(b64Data);
         } else if (dataObj.is<const char*>()) {
             // 格式B: data直接是base64字符串（legacy格式）
             chunkIndex = pixelDoc["chunk"] | 0;
@@ -695,23 +709,25 @@ void parseServerData(String json) {
             b64Len = strlen(b64Data);
         } else {
             Serial.println("[Main] Pixel: unknown data format");
+            free(writeableBuf);
             return;
         }
         
-        if (!b64Data || b64Len == 0) { Serial.println("[Main] Pixel: empty base64 data"); return; }
+        if (!b64Data || b64Len == 0) { Serial.println("[Main] Pixel: empty base64 data"); free(writeableBuf); return; }
 
         if (chunkIndex == 0) {
             g_pxlBuffer = g_pxlPool;
             g_pxlCapacity = PXL_POOL_SIZE;
             g_pxlOffset = 0;
         }
-        if (!g_pxlBuffer) { Serial.println("[Main] Pixel: buffer alloc failed"); return; }
+        if (!g_pxlBuffer) { Serial.println("[Main] Pixel: buffer alloc failed"); free(writeableBuf); return; }
 
         // 预估解码后大小（base64: 每4字节→3字节二进制）
         size_t estimatedDecoded = b64Len * 3 / 4;
         if (g_pxlOffset + estimatedDecoded > g_pxlCapacity) {
             Serial.printf("[Main] Pixel: overflow! offset=%d est_decoded=%d cap=%d\n",
                           g_pxlOffset, estimatedDecoded, (int)g_pxlCapacity);
+            free(writeableBuf);
             return;
         }
 
@@ -724,10 +740,14 @@ void parseServerData(String json) {
                                         b64Len);
         if (ret != 0) {
             Serial.printf("[Main] Pixel: base64 decode error %d (chunk %d)\n", ret, chunkIndex);
+            free(writeableBuf);
             return;
         }
         g_pxlOffset += written;
         Serial.printf("[Main] Pixel chunk %d decoded: %d bytes, total %d\n", chunkIndex, written, g_pxlOffset);
+
+        // 零拷贝缓冲区可安全释放（b64Data已在decode后不再需要）
+        free(writeableBuf);
 
         if (isLastChunk && g_pxlBuffer) {
             // 将缓冲区指针传递给 Core 1，由它在自己的时间片内加载
