@@ -191,30 +191,31 @@ class SerialCommunication(CommunicationBase):
         while self._running and self._connected:
             try:
                 if self._serial and self._serial.in_waiting:
-                    char = self._serial.read().decode('utf-8', errors='replace')
-                    if char == '\n':
-                        line = buffer
-                        buffer = ""
-                        
-                        if expected_len is not None:
-                            # 正在读取帧payload
-                            payload_buf += line
-                            if len(payload_buf) >= expected_len:
-                                self._process_received(payload_buf[:expected_len])
-                                expected_len = None
-                                payload_buf = ""
-                        elif line.startswith("LEN:"):
-                            # 新帧协议: LEN:NNNN
-                            try:
-                                expected_len = int(line[4:])
-                                payload_buf = ""
-                            except ValueError:
-                                logger.warning(f"Invalid LEN line: {line}")
-                        elif line:
-                            # 旧格式fallback: 纯JSON行
-                            self._process_received(line.strip())
-                    else:
-                        buffer += char
+                    raw = self._serial.read(self._serial.in_waiting).decode('utf-8', errors='replace')
+                    for char in raw:
+                        if char == '\n':
+                            line = buffer
+                            buffer = ""
+                            
+                            if expected_len is not None:
+                                # 正在读取帧payload
+                                payload_buf += line
+                                if len(payload_buf) >= expected_len:
+                                    self._process_received(payload_buf[:expected_len])
+                                    expected_len = None
+                                    payload_buf = ""
+                            elif line.startswith("LEN:"):
+                                # 新帧协议: LEN:NNNN
+                                try:
+                                    expected_len = int(line[4:])
+                                    payload_buf = ""
+                                except ValueError:
+                                    logger.warning(f"Invalid LEN line: {line}")
+                            elif line:
+                                # 旧格式fallback: 纯JSON行
+                                self._process_received(line.strip())
+                        else:
+                            buffer += char
                 else:
                     time.sleep(SERIAL_READ_POLL_INTERVAL)
                     
@@ -458,6 +459,22 @@ class WiFiCommunication(CommunicationBase):
             except Exception as e:
                 logger.error(f"发送worker错误: {e}")
                 time.sleep(0.1)
+    
+    def _flush_send(self, msg):
+        """底层同步发送：序列化+帧协议发送（被队列worker和keepalive调用）"""
+        payload = json.dumps({"type": msg.msg_type, "data": msg.data, "ts": msg.timestamp})
+        frame = f"LEN:{len(payload)}\n{payload}\n"
+        with self._lock:
+            if self._client_socket and self._connected:
+                try:
+                    self._client_socket.sendall(frame.encode('utf-8'))
+                except Exception as e:
+                    logger.error(f"_flush_send失败: {e}")
+                    if self._client_socket:
+                        try: self._client_socket.close()
+                        except: pass
+                    self._client_socket = None
+                    self._connected = False
     
     def _keepalive_loop(self):
         """Keep-Alive心跳：定期发送ping，超时无pong则断连"""

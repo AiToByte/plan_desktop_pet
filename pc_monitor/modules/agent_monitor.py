@@ -21,6 +21,7 @@ import json
 import time
 import logging
 from typing import Dict, Optional, List, Any
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 
@@ -87,7 +88,7 @@ class AgentMonitor:
         self._running: bool = False
         self._current_state: Optional[AgentState] = None
         self._cached_proc: Optional[psutil.Process] = None
-        self._cpu_history: List[float] = []
+        self._cpu_history: deque = deque(maxlen=CPU_HISTORY_WINDOW)
         self._idle_streak: int = 0
         
         # JSONL auth检测配置
@@ -131,10 +132,8 @@ class AgentMonitor:
             # 非阻塞调用：首次返回0，后续返回自上次调用以来的CPU%
             cpu_percent: float = proc.cpu_percent(interval=0)
 
-            # 维护滑动窗口
+            # 维护滑动窗口 (deque maxlen自动淘汰旧数据)
             self._cpu_history.append(cpu_percent)
-            if len(self._cpu_history) > CPU_HISTORY_WINDOW:
-                self._cpu_history.pop(0)
 
             avg_cpu: float = sum(self._cpu_history) / len(self._cpu_history)
 
@@ -250,7 +249,7 @@ class AgentMonitor:
         # 2. 如果无缓存，则重新查找
         if self._cached_proc is None:
             self._cached_proc = self._find_agent_process()
-            self._cpu_history = []
+            self._cpu_history = deque(maxlen=CPU_HISTORY_WINDOW)
             self._idle_streak = 0
             if self._cached_proc:
                 # 预热首次采样（丢弃结果）

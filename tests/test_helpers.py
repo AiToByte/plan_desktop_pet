@@ -25,6 +25,7 @@ requests_mock.exceptions.RequestException = type('RequestException', (Exception,
 requests_mock.exceptions.Timeout = type('Timeout', (Exception,), {})
 requests_mock.exceptions.ConnectionError = type('ConnectionError', (Exception,), {})
 sys.modules['requests'] = requests_mock
+sys.modules['requests.exceptions'] = requests_mock.exceptions
 
 # Mock http.server (for otlp_receiver)
 # Already available in stdlib, no need to mock

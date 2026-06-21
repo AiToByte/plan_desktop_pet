@@ -256,10 +256,23 @@ void SoundManager::_i2sTone(uint16_t freq, uint16_t duration) {
         baseBuf[i] = (uint8_t)(128 + 120 * sinf(angle));
     }
     
-    // ADSR参数 (单位: ms)
-    const uint16_t attackMs  = 8;   // 淡入 (最小瞬态)
-    const uint16_t decayMs   = 0;   // 无衰减(纯正弦不需要)
-    const uint16_t releaseMs = 15;  // 淡出 (消除断尾爆音)
+    // ADSR参数动态缩放：短音(<80ms)时压缩attack/release，保证有效响铃时间
+    uint16_t attackMs  = 8;   // 淡入 (最小瞬态)
+    uint16_t decayMs   = 0;   // 无衰减(纯正弦不需要)
+    uint16_t releaseMs = 15;  // 淡出 (消除断尾爆音)
+    
+    // 短音保护：attack+release不能超过duration的20%，最少保留80%有效响铃
+    uint16_t envelopeBudget = (duration * 20) / 100;  // 20%的duration留给包络
+    uint16_t totalEnvelope = attackMs + releaseMs;
+    if (totalEnvelope > envelopeBudget && envelopeBudget > 0) {
+        float scale = (float)envelopeBudget / (float)totalEnvelope;
+        attackMs  = (uint16_t)(attackMs * scale);
+        releaseMs = (uint16_t)(releaseMs * scale);
+        // 确保至少1ms的attack和release
+        if (attackMs < 1) attackMs = 1;
+        if (releaseMs < 1) releaseMs = 1;
+    }
+    
     unsigned long now = millis();
     unsigned long endTime = now + duration;
     unsigned long releaseStart = endTime - releaseMs;

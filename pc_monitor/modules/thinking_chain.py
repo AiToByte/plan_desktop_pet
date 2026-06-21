@@ -215,7 +215,15 @@ class ThinkingChainTracker:
         
         payload = json_str.encode("utf-8")
         header = f"LEN:{len(payload)}\n".encode("utf-8")
-        self._sock.sendall(header + payload)
+        try:
+            self._sock.sendall(header + payload)
+        except OSError as e:
+            logger.warning(f"[Thinking] sendall失败，清理连接: {e}")
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
     
     def close(self):
         """关闭连接"""
