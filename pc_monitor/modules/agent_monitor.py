@@ -233,8 +233,8 @@ class AgentMonitor:
                         if "AskUser" in tool_name or "ask" in tool_name.lower():
                             return True
                             
-        except (json.JSONDecodeError, AttributeError, TypeError):
-            pass
+        except (json.JSONDecodeError, AttributeError, TypeError) as e:
+            logger.debug(f"解析Agent数据失败: {e}")
         return False
     
     def get_state(self) -> AgentState:

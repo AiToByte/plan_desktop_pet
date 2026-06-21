@@ -204,9 +204,14 @@ class ThinkingChainTracker:
     def _send_framed(self, json_str: str) -> None:
         """使用长度前缀帧协议发送 (与 CommManager 一致)"""
         if not self._sock:
-            self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self._sock.settimeout(3.0)
-            self._sock.connect((self._esp32_host, self._esp32_port))
+            try:
+                self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self._sock.settimeout(3.0)
+                self._sock.connect((self._esp32_host, self._esp32_port))
+            except (ConnectionRefusedError, socket.timeout, OSError) as e:
+                logger.debug(f"[Thinking] 连接ESP32失败: {e}")
+                self._sock = None
+                return
         
         payload = json_str.encode("utf-8")
         header = f"LEN:{len(payload)}\n".encode("utf-8")
@@ -217,8 +222,8 @@ class ThinkingChainTracker:
         if self._sock:
             try:
                 self._sock.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"关闭socket异常: {e}")
             self._sock = None
 
 

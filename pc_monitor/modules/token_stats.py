@@ -180,8 +180,8 @@ class TokenTracker:
                     "input_tokens": int(usage.get("input_tokens", 0)),
                     "output_tokens": int(usage.get("output_tokens", 0))
                 }
-        except (json.JSONDecodeError, AttributeError, ValueError):
-            pass
+        except (json.JSONDecodeError, AttributeError, ValueError) as e:
+            logger.debug(f"解析Token统计数据失败: {e}")
         
         # fallback: 正则匹配纯文本格式
         patterns = [

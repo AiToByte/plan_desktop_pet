@@ -66,12 +66,15 @@ class CommunicationBase:
         self._message_callback = callback
     
     def connect(self) -> bool:
+        """建立连接，返回是否成功"""
         raise NotImplementedError
     
     def disconnect(self):
+        """断开连接"""
         raise NotImplementedError
     
     def send_message(self, msg: DeviceMessage) -> bool:
+        """发送消息，返回是否成功"""
         raise NotImplementedError
     
     def is_connected(self) -> bool:
@@ -105,6 +108,11 @@ class SerialCommunication(CommunicationBase):
     def connect(self) -> bool:
         """连接串口"""
         try:
+            # 等待旧读取线程退出，避免重复线程同时读serial
+            if self._read_thread and self._read_thread.is_alive():
+                self._running = False
+                self._read_thread.join(timeout=3)
+            
             self._serial = serial.Serial(
                 port=self.port,
                 baudrate=self.baudrate,
@@ -183,7 +191,7 @@ class SerialCommunication(CommunicationBase):
         while self._running and self._connected:
             try:
                 if self._serial and self._serial.in_waiting:
-                    char = self._serial.read().decode('utf-8', errors='ignore')
+                    char = self._serial.read().decode('utf-8', errors='replace')
                     if char == '\n':
                         line = buffer
                         buffer = ""
@@ -302,8 +310,8 @@ class WiFiCommunication(CommunicationBase):
                     if self._client_socket:
                         try:
                             self._client_socket.close()
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug(f"关闭旧客户端连接失败: {e}")
                     
                     self._client_socket = client_socket
                     self._client_addr = client_addr
@@ -318,6 +326,13 @@ class WiFiCommunication(CommunicationBase):
                 self._read_thread = threading.Thread(target=self._read_loop, daemon=True)
                 self._read_thread.start()
                 
+                # 重启Keep-Alive线程（旧线程可能已因超时退出）
+                self._last_pong_time = time.time()
+                self._ping_pending = False
+                if not self._keepalive_thread or not self._keepalive_thread.is_alive():
+                    self._keepalive_thread = threading.Thread(target=self._keepalive_loop, daemon=True)
+                    self._keepalive_thread.start()
+                
             except socket.timeout:
                 continue
             except Exception as e:
@@ -328,12 +343,11 @@ class WiFiCommunication(CommunicationBase):
     def _get_local_ip(self) -> str:
         """获取本机局域网IP地址"""
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
-        except Exception:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("8.8.8.8", 80))
+                return s.getsockname()[0]
+        except Exception as e:
+            logger.debug(f"获取本机IP失败: {e}")
             return "127.0.0.1"
     
     def _udp_broadcast_loop(self):
@@ -341,28 +355,33 @@ class WiFiCommunication(CommunicationBase):
         local_ip = self._get_local_ip()
         msg = f"DESKTOP_PET_SERVER:{local_ip}:{self.port}"
         
-        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        udp_sock.settimeout(1)
-        
-        logger.info(f"UDP广播已启动: {msg} -> port {self.udp_broadcast_port}")
-        
-        while self._running:
-            try:
-                udp_sock.sendto(msg.encode('utf-8'), ('<broadcast>', self.udp_broadcast_port))
-            except Exception as e:
-                logger.warning(f"UDP广播发送失败: {e}")
-            
-            # 分段sleep，快速响应_running变化
-            for _ in range(int(self.udp_broadcast_interval * 10)):
-                if not self._running:
-                    break
-                time.sleep(BROADCAST_SLEEP_STEP)
-        
+        udp_sock = None
         try:
-            udp_sock.close()
-        except Exception:
-            pass
+            udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            udp_sock.settimeout(1)
+            
+            logger.info(f"UDP广播已启动: {msg} -> port {self.udp_broadcast_port}")
+            
+            while self._running:
+                try:
+                    udp_sock.sendto(msg.encode('utf-8'), ('<broadcast>', self.udp_broadcast_port))
+                except Exception as e:
+                    logger.warning(f"UDP广播发送失败: {e}")
+                
+                # 分段sleep，快速响应_running变化
+                for _ in range(int(self.udp_broadcast_interval * 10)):
+                    if not self._running:
+                        break
+                    time.sleep(BROADCAST_SLEEP_STEP)
+        except Exception as e:
+            logger.error(f"UDP广播循环异常: {e}")
+        finally:
+            if udp_sock:
+                try:
+                    udp_sock.close()
+                except Exception as e:
+                    logger.debug(f"关闭UDP socket失败: {e}")
         logger.info("UDP广播已停止")
     
     def disconnect(self):
@@ -374,53 +393,58 @@ class WiFiCommunication(CommunicationBase):
             if self._client_socket:
                 try:
                     self._client_socket.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"关闭客户端连接失败: {e}")
                 self._client_socket = None
                 self._client_addr = None
             
             if self._server_socket:
                 try:
                     self._server_socket.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"关闭服务端socket失败: {e}")
                 self._server_socket = None
         
         logger.info("TCP Server 已关闭")
     
     def send_message(self, msg: DeviceMessage) -> bool:
         """发送消息到已连接的ESP32（带长度前缀帧）"""
+        need_sleep = False
         with self._lock:
             if not self._client_socket:
-                # 尝试重连
                 if self._reconnect_attempts < self._max_reconnect_attempts:
                     logger.info(f"无客户端连接，等待新连接 ({self._reconnect_attempts + 1}/{self._max_reconnect_attempts})")
                     self._reconnect_attempts += 1
-                    time.sleep(self._reconnect_delay)
-                return False
-            
-            try:
-                payload = json.dumps({
-                    "type": msg.msg_type,
-                    "data": msg.data,
-                    "ts": msg.timestamp
-                })
-                frame = f"LEN:{len(payload)}\n{payload}\n"
-                self._client_socket.sendall(frame.encode('utf-8'))
-                self._reconnect_attempts = 0  # 发送成功，重置重连计数
-                return True
-                
-            except Exception as e:
-                logger.error(f"发送消息失败: {e}")
-                self._client_socket = None
-                self._client_addr = None
-                self._connected = False
-                # 尝试重连
-                if self._reconnect_attempts < self._max_reconnect_attempts:
-                    logger.info(f"发送失败，等待新连接 ({self._reconnect_attempts + 1}/{self._max_reconnect_attempts})")
-                    self._reconnect_attempts += 1
-                    time.sleep(self._reconnect_delay)
-                return False
+                    need_sleep = True
+                if need_sleep:
+                    pass  # sleep在锁外执行
+                else:
+                    return False
+            else:
+                try:
+                    payload = json.dumps({
+                        "type": msg.msg_type,
+                        "data": msg.data,
+                        "ts": msg.timestamp
+                    })
+                    frame = f"LEN:{len(payload)}\n{payload}\n"
+                    self._client_socket.sendall(frame.encode('utf-8'))
+                    self._reconnect_attempts = 0
+                    return True
+                except Exception as e:
+                    logger.error(f"发送消息失败: {e}")
+                    self._client_socket = None
+                    self._client_addr = None
+                    self._connected = False
+                    if self._reconnect_attempts < self._max_reconnect_attempts:
+                        logger.info(f"发送失败，等待新连接 ({self._reconnect_attempts + 1}/{self._max_reconnect_attempts})")
+                        self._reconnect_attempts += 1
+                        need_sleep = True
+        
+        # sleep在锁外执行，避免阻塞其他线程
+        if need_sleep:
+            time.sleep(self._reconnect_delay)
+        return False
     
 
     def _send_queue_worker(self):
@@ -449,7 +473,8 @@ class WiFiCommunication(CommunicationBase):
                 with self._lock:
                     if self._client_socket:
                         try: self._client_socket.close()
-                        except Exception: pass
+                        except Exception as e:
+                            logger.debug(f"关闭超时客户端socket失败: {e}")
                         self._client_socket = None
                     self._connected = False
                 break

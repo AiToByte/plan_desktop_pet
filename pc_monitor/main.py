@@ -235,8 +235,8 @@ class DesktopPetMonitor:
         weather_interval = self.config.get("weather", {}).get("update_interval", 1800)
         
         now = time.time()
-        self._last_token_update = now
-        self._last_weather_update = now
+        self._last_token_update = 0.0  # 0触发首次立即更新
+        self._last_weather_update = 0.0
         
         while self.running:
             now = time.time()
@@ -274,7 +274,7 @@ class DesktopPetMonitor:
         
         # 启动OTLP接收器
         self._otlp_receiver.start()
-        logger.info(f"OTLP接收器已启动，端口: {otlp_port}")
+        logger.info(f"OTLP接收器已启动，端口: {self._otlp_receiver.port}")
         
         # 启动定时更新线程
         update_thread = threading.Thread(target=self._periodic_update, daemon=True)
