@@ -140,10 +140,13 @@ class SerialCommunication(CommunicationBase):
                 logger.info(f"尝试重连 ({self._reconnect_attempts + 1}/{self._max_reconnect_attempts})")
                 if self.connect():
                     self._reconnect_attempts = 0
+                    # 重连成功，继续发送
                 else:
                     self._reconnect_attempts += 1
                     time.sleep(self._reconnect_delay)
-            return False
+                    return False
+            else:
+                return False
         
         try:
             payload = json.dumps({
@@ -307,14 +310,14 @@ class WiFiCommunication(CommunicationBase):
                     
                     self._client_socket = client_socket
                     self._client_addr = client_addr
+                    self._connected = True
                 
                 logger.info(f"ESP32 已连接: {client_addr[0]}:{client_addr[1]}")
-                self._connected = True
                 
                 # 启动读取线程
                 if self._read_thread and self._read_thread.is_alive():
-                    # 旧的读取线程会因为 socket 关闭而退出
-                    pass
+                    # 等待旧的读取线程因 socket 关闭而退出（最多2秒）
+                    self._read_thread.join(timeout=2.0)
                 self._read_thread = threading.Thread(target=self._read_loop, daemon=True)
                 self._read_thread.start()
                 
@@ -329,10 +332,12 @@ class WiFiCommunication(CommunicationBase):
         """获取本机局域网IP地址"""
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
+            try:
+                s.connect(("8.8.8.8", 80))
+                ip = s.getsockname()[0]
+                return ip
+            finally:
+                s.close()
         except Exception:
             return "127.0.0.1"
     
@@ -389,38 +394,17 @@ class WiFiCommunication(CommunicationBase):
         logger.info("TCP Server 已关闭")
     
     def send_message(self, msg: DeviceMessage) -> bool:
-        """发送消息到已连接的ESP32（带长度前缀帧）"""
-        with self._lock:
-            if not self._client_socket:
-                # 尝试重连
-                if self._reconnect_attempts < self._max_reconnect_attempts:
-                    logger.info(f"无客户端连接，等待新连接 ({self._reconnect_attempts + 1}/{self._max_reconnect_attempts})")
-                    self._reconnect_attempts += 1
-                    time.sleep(self._reconnect_delay)
-                return False
-            
-            try:
-                payload = json.dumps({
-                    "type": msg.msg_type,
-                    "data": msg.data,
-                    "ts": msg.timestamp
-                })
-                frame = f"LEN:{len(payload)}\n{payload}\n"
-                self._client_socket.sendall(frame.encode('utf-8'))
-                self._reconnect_attempts = 0  # 发送成功，重置重连计数
-                return True
-                
-            except Exception as e:
-                logger.error(f"发送消息失败: {e}")
-                self._client_socket = None
-                self._client_addr = None
-                self._connected = False
-                # 尝试重连
-                if self._reconnect_attempts < self._max_reconnect_attempts:
-                    logger.info(f"发送失败，等待新连接 ({self._reconnect_attempts + 1}/{self._max_reconnect_attempts})")
-                    self._reconnect_attempts += 1
-                    time.sleep(self._reconnect_delay)
-                return False
+        """发送消息到已连接的ESP32（异步队列化，避免阻塞调用方）"""
+        if not self._connected:
+            logger.warning("未连接，无法发送消息")
+            return False
+        
+        try:
+            self._send_queue.put_nowait(msg)
+            return True
+        except Exception:
+            logger.warning("发送队列已满，丢弃消息")
+            return False
     
 
     def _send_queue_worker(self):
@@ -436,11 +420,13 @@ class WiFiCommunication(CommunicationBase):
                 time.sleep(0.1)
     
     def _keepalive_loop(self):
-        """Keep-Alive心跳：定期发送ping，超时无pong则断连"""
+        """Keep-Alive心跳：定期发送ping，超时无pong则断连。断连后等待重连而非退出。"""
         while self._running:
             time.sleep(KEEPALIVE_INTERVAL)
-            if not self._running or not self._connected:
+            if not self._running:
                 break
+            if not self._connected:
+                continue  # 等待重连，不永久退出
             
             now = time.time()
             # 检查pong超时
@@ -452,7 +438,7 @@ class WiFiCommunication(CommunicationBase):
                         except Exception: pass
                         self._client_socket = None
                     self._connected = False
-                break
+                continue  # 断连后继续循环，等待重连后恢复心跳
             
             # 发送ping
             try:
@@ -480,7 +466,7 @@ class WiFiCommunication(CommunicationBase):
                     with self._lock:
                         self._client_socket = None
                         self._client_addr = None
-                    self._connected = False
+                        self._connected = False
                     break
                 
                 buffer += data
@@ -521,7 +507,7 @@ class WiFiCommunication(CommunicationBase):
                 with self._lock:
                     self._client_socket = None
                     self._client_addr = None
-                self._connected = False
+                    self._connected = False
                 break
     
     def _process_received(self, data: str):

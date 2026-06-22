@@ -7,6 +7,7 @@
 
 #include <Arduino.h>
 #include <atomic>
+#include <esp_attr.h>
 #include <mbedtls/base64.h>
 #include "config.h"
 #include "types.h"
@@ -20,6 +21,8 @@
 #include <esp_ota_ops.h>
 #include <esp_sleep.h>
 #include "driver/rtc_io.h"
+#include "ambient_light.h"
+#include "haptic_driver.h"
 
 // ============ 共享数据 (双缓冲+atomic指针交换，无mutex阻塞) ============
 DisplayData g_displayBuf[2];           // 双缓冲：front=read, back=write
@@ -42,6 +45,8 @@ CommManager comm;
 PixelPlayer pixelPlayer;
 SoundManager sound;
 TouchHandler touch;
+AmbientLightManager ambientLight;
+HapticDriver hapticDriver;
 
 // 任务句柄
 TaskHandle_t g_commTaskHandle = NULL;
@@ -226,6 +231,7 @@ void commTask(void* pvParameters) {
 // ============ 渲染任务 (Core 1) ============
 void renderTask(void* pvParameters) {
     Serial.println("[RenderTask] Started on Core 1");
+    display.setupVSync();  // 初始化TE同步（硬件中断或软件自适应）
     unsigned long lastDisplayUpdate = 0;
     unsigned long lastAnimationUpdate = 0;
     
@@ -331,6 +337,7 @@ void renderTask(void* pvParameters) {
         }
         
         // ===== 显示更新 =====
+        display.waitForVSync();  // 等待TE信号/软件帧间隔，防止撕裂
         if (now - lastDisplayUpdate >= UPDATE_INTERVAL) {
             lastDisplayUpdate = now;
             if (!localData.connected && !pixelPlayer.isLoaded()) {
@@ -415,6 +422,18 @@ void renderTask(void* pvParameters) {
         // 触摸检测
         touch.update();
         
+        // [Phase 4] 光照传感器：定期读取 + 自动背光调节
+        static unsigned long lastLightRead = 0;
+        if (ambientLight.isAvailable() && !g_screenSleeping && 
+            (now - lastLightRead >= BH1750_READ_INTERVAL)) {
+            ambientLight.readLux();
+            uint16_t lux = ambientLight.getLux();
+            uint8_t pwm = ambientLight.autoAdjustBacklight(lux);
+            display.setBrightness(pwm);
+            lastLightRead = now;
+            log_i("[Light] %d lux → PWM %d", lux, pwm);
+        }
+        
         // [Phase 1] 接近感应：自动唤醒屏幕
         if (!g_screenSleeping) {
             touch.proximity.update();
@@ -443,7 +462,7 @@ void setup() {
     // [Phase 2] 崩溃遥测：检查reset reason
     esp_reset_reason_t resetReason = esp_reset_reason();
     Serial.printf("[INIT] Reset reason: %d\n", resetReason);
-    static uint32_t s_crashCount = 0;
+    static RTC_NOINIT_ATTR uint32_t s_crashCount;
     if (resetReason == ESP_RST_PANIC || resetReason == ESP_RST_TASK_WDT || 
         resetReason == ESP_RST_INT_WDT) {
         s_crashCount++;
@@ -483,17 +502,39 @@ void setup() {
     touch.setCallback([](TouchEvent e) {
         if (e == TOUCH_SINGLE_TAP) {
             sound.playNotification();
+            hapticDriver.click();  // 触觉反馈：轻击
             Serial.println("[Touch] Single tap");
         } else if (e == TOUCH_DOUBLE_TAP) {
             sound.playNotification();
+            hapticDriver.buzz();  // 触觉反馈：双击嗡嗡
             Serial.println("[Touch] Double tap");
         } else if (e == TOUCH_LONG_PRESS) {
             sound.playAlert();
+            hapticDriver.strongHit();  // 触觉反馈：长按强击
             Serial.println("[Touch] Long press");
         } else if (e == TOUCH_PROXIMITY) {
             Serial.println("[Touch] Proximity detected");
         }
     });
+    
+    // 初始化光照传感器
+    Serial.println("[INIT] 初始化BH1750光照传感器...");
+    ambientLight.begin(BH1750_SDA_PIN, BH1750_SCL_PIN);
+    if (ambientLight.isAvailable()) {
+        Serial.println("[INIT] BH1750 ready");
+    } else {
+        Serial.println("[INIT] BH1750 not found, skipping");
+    }
+    
+    // 初始化触觉反馈
+    Serial.println("[INIT] 初始化DRV2605L触觉反馈...");
+    hapticDriver.begin(HAPTIC_SDA_PIN, HAPTIC_SCL_PIN);
+    if (hapticDriver.isAvailable()) {
+        hapticDriver.click();  // 初始化完成提示
+        Serial.println("[INIT] DRV2605L ready");
+    } else {
+        Serial.println("[INIT] DRV2605L not found, skipping");
+    }
     
     // 初始化WiFi
     Serial.println("[INIT] 连接WiFi...");

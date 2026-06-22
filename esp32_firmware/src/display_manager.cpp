@@ -137,8 +137,8 @@ void DisplayManager::updateAnimation() {
         // 重绘表情
         drawFace(faceX, faceY, _currentFace, _animFrame);
 
-        // 提交局部刷新区域到屏幕（LovyanGFX不支持区域pushSprite，推送全屏）
-        _sprite.pushSprite(&_lcd, 0, 0);
+        // 脏矩形：仅推送表情动画区域（约240×40 vs 全屏240×240，减少80% SPI传输）
+        _sprite.pushSprite(&_lcd, 0, faceY - 4, 0, faceY - 4, SCREEN_WIDTH, FACE_SIZE + 8);
     }
 }
 

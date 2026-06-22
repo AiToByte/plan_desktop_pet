@@ -20,6 +20,7 @@ import glob
 import json
 import time
 import logging
+import threading
 from typing import Dict, Optional, List, Any
 from dataclasses import dataclass
 from enum import Enum
@@ -85,6 +86,7 @@ class AgentMonitor:
         self.process_names: List[str] = config.get("process_names", DEFAULT_PROCESS_NAMES)
         self.check_interval: int = config.get("check_interval", DEFAULT_CHECK_INTERVAL)
         self._running: bool = False
+        self._stop_event: threading.Event = threading.Event()
         self._current_state: Optional[AgentState] = None
         self._cached_proc: Optional[psutil.Process] = None
         self._cpu_history: List[float] = []
@@ -311,8 +313,9 @@ class AgentMonitor:
             )
     
     def start_monitoring(self, callback=None):
-        """启动持续监控"""
+        """启动持续监控（使用Event实现即时停止）"""
         self._running = True
+        self._stop_event.clear()
         logger.info("Agent监控已启动")
         
         while self._running:
@@ -322,9 +325,11 @@ class AgentMonitor:
             if callback:
                 callback(state)
                 
-            time.sleep(self.check_interval)
+            # Event.wait替代time.sleep：stop时立即唤醒，无需等待完整间隔
+            self._stop_event.wait(timeout=self.check_interval)
     
     def stop_monitoring(self):
-        """停止监控"""
+        """停止监控（立即生效，无需等待当前间隔结束）"""
         self._running = False
+        self._stop_event.set()  # 唤醒阻塞的wait
         logger.info("Agent监控已停止")

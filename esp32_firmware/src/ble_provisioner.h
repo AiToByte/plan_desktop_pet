@@ -19,6 +19,8 @@
 #ifndef BLE_PROVISIONER_H
 #define BLE_PROVISIONER_H
 
+#ifdef BLE_PROVISIONING_ENABLED  // 条件编译：未定义时整个模块不参与编译
+
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 #include <Preferences.h>
@@ -69,4 +71,5 @@ private:
     class PortCallback;
 };
 
+#endif // BLE_PROVISIONING_ENABLED
 #endif // BLE_PROVISIONER_H

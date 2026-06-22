@@ -202,7 +202,9 @@ class ThinkingChainTracker:
             logger.warning(f"[Thinking] Failed to send to ESP32: {e}")
     
     def _send_framed(self, json_str: str) -> None:
-        """使用长度前缀帧协议发送 (与 CommManager 一致)"""
+        """使用长度前缀帧协议发送 (与 CommManager 一致)
+        自动重连：发送失败时关闭旧socket并重建一次
+        """
         if not self._sock:
             self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self._sock.settimeout(3.0)
@@ -210,7 +212,18 @@ class ThinkingChainTracker:
         
         payload = json_str.encode("utf-8")
         header = f"LEN:{len(payload)}\n".encode("utf-8")
-        self._sock.sendall(header + payload)
+        try:
+            self._sock.sendall(header + payload)
+        except (OSError, BrokenPipeError, ConnectionResetError):
+            # 连接已断，关闭旧socket并重建一次
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._sock.settimeout(3.0)
+            self._sock.connect((self._esp32_host, self._esp32_port))
+            self._sock.sendall(header + payload)
     
     def close(self):
         """关闭连接"""

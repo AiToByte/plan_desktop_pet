@@ -66,7 +66,6 @@ class StatusPanel(tk.Toplevel):
     def __init__(self, master, token_history: TokenHistory):
         super().__init__(master)
         self.title("Pet Status")
-        self.geometry("400x300")
         self.attributes('-topmost', True)
         self.resizable(False, False)
 
@@ -76,6 +75,14 @@ class StatusPanel(tk.Toplevel):
         self._create_info_frame()
         # Token曲线
         self._create_chart()
+
+        # 多显示器适配：定位到鼠标所在的显示器
+        self._position_on_current_monitor()
+
+        # 支持拖拽移动
+        self._drag_data = {'x': 0, 'y': 0}
+        self.bind('<Button-1>', self._on_drag_start)
+        self.bind('<B1-Motion>', self._on_drag_motion)
 
         # 定时刷新
         self._refresh_interval_ms = 2000
@@ -152,6 +159,49 @@ class StatusPanel(tk.Toplevel):
             self.ax.set_xticks(tick_pos)
             self.ax.set_xticklabels([x[i] for i in tick_pos], fontsize=7)
         self.canvas.draw_idle()
+
+    def _position_on_current_monitor(self):
+        """多显示器适配：根据鼠标位置定位panel到当前显示器可见区域"""
+        self.update_idletasks()  # 确保winfo获取准确尺寸
+        panel_w, panel_h = 400, 300
+        # 获取鼠标当前位置（跨显示器准确）
+        mx, py = self.winfo_pointerx(), self.winfo_pointery()
+        # 获取鼠标所在屏幕的范围
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        # 尝试用tkinter内置方法检测多显示器边界
+        # winfo_vrootwidth/height 返回虚拟桌面总尺寸（多显示器时大于单屏）
+        vroot_w = self.winfo_vrootwidth()
+        vroot_h = self.winfo_vrootheight()
+        vroot_x = self.winfo_vrootx()
+        vroot_y = self.winfo_vrooty()
+        # 计算：panel放在鼠标右下方，但不超出当前显示器可视区域
+        # 简单策略：如果鼠标在虚拟桌面范围内，用鼠标位置偏移
+        # 否则回退到主屏幕中央
+        if vroot_w > screen_w:
+            # 多显示器环境：使用虚拟桌面坐标
+            x = min(mx + 20, vroot_x + vroot_w - panel_w - 10)
+            y = min(py + 20, vroot_y + vroot_h - panel_h - 10)
+        else:
+            # 单显示器：居中
+            x = (screen_w - panel_w) // 2
+            y = (screen_h - panel_h) // 2
+        x = max(x, 0)
+        y = max(y, 0)
+        self.geometry(f"{panel_w}x{panel_h}+{x}+{y}")
+
+    def _on_drag_start(self, event):
+        """拖拽开始：记录鼠标在窗口内的偏移"""
+        self._drag_data['x'] = event.x
+        self._drag_data['y'] = event.y
+
+    def _on_drag_motion(self, event):
+        """拖拽移动：更新窗口位置"""
+        dx = event.x - self._drag_data['x']
+        dy = event.y - self._drag_data['y']
+        x = self.winfo_x() + dx
+        y = self.winfo_y() + dy
+        self.geometry(f"+{x}+{y}")
 
 
 # ============ 托盘图标 ============

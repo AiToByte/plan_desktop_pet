@@ -104,7 +104,6 @@ void CommManager::reconnect() {
     
     Serial.printf("[Comm] Reconnecting #%d (backoff %lu ms)...\n",
                   _reconnectFailCount, _reconnectInterval);
-    disconnect();
     connect();
     
     // 指数退避：每次失败翻倍，上限60秒
@@ -121,6 +120,25 @@ void CommManager::update() {
         for (size_t i = 0; i < bytesRead; i++) {
             char c = _readBuf[i];
         
+            // [Step 3] 帧体批量写入优化：直接从readBuf拷贝剩余字节，避免逐字符String追加
+            // 在FRAME_READ_BODY状态下，跳过逐字符状态机，直接批量追加
+            if (_frameState == FRAME_READ_BODY && i < bytesRead) {
+                int remaining = _expectedLen - (int)_frameBuffer.length();
+                int available = (int)(bytesRead - i);
+                int toCopy = (remaining < available) ? remaining : available;
+                if (toCopy > 0) {
+                    _frameBuffer.concat(&_readBuf[i], toCopy);
+                    i += toCopy - 1;  // -1 because for loop will i++
+                    if ((int)_frameBuffer.length() >= _expectedLen) {
+                        processData(_frameBuffer);
+                        _frameBuffer = "";
+                        _expectedLen = 0;
+                        _frameState = FRAME_IDLE;
+                    }
+                    continue;
+                }
+            }
+            
             switch (_frameState) {
                 case FRAME_IDLE:
                     // 检测帧类型：'L' = 长度前缀, '{' = 旧格式JSON

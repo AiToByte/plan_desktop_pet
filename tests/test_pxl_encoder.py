@@ -7,6 +7,7 @@ import tempfile
 
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+from PIL import Image
 
 # 添加项目路径
 import sys
@@ -59,16 +60,11 @@ class TestRgb888ToRgb565(unittest.TestCase):
 
 
 class TestImageToRgb565Data(unittest.TestCase):
-    """测试图像转RGB565数据"""
+    """测试图像转RGB565数据（使用真实PIL Image）"""
 
     def test_1x1_white_image(self):
         """1x1白色图像"""
-        img = MagicMock()
-        img.convert.return_value = img
-        img.size = (1, 1)
-        pixels = {(0, 0): (255, 255, 255)}
-        img.load.return_value = pixels
-
+        img = Image.new('RGB', (1, 1), (255, 255, 255))
         data = image_to_rgb565_data(img)
         assert len(data) == 2  # 1像素 * 2字节
         pixel = struct.unpack('<H', data)[0]
@@ -76,19 +72,26 @@ class TestImageToRgb565Data(unittest.TestCase):
 
     def test_2x2_image_size(self):
         """2x2图像应该产生8字节"""
-        img = MagicMock()
-        img.convert.return_value = img
-        img.size = (2, 2)
-        pixels = {
-            (0, 0): (255, 0, 0),
-            (1, 0): (0, 255, 0),
-            (0, 1): (0, 0, 255),
-            (1, 1): (0, 0, 0),
-        }
-        img.load.return_value = pixels
-
+        img = Image.new('RGB', (2, 2), (0, 0, 0))
+        img.putpixel((0, 0), (255, 0, 0))
+        img.putpixel((1, 0), (0, 255, 0))
+        img.putpixel((0, 1), (0, 0, 255))
+        img.putpixel((1, 1), (0, 0, 0))
         data = image_to_rgb565_data(img)
         assert len(data) == 8  # 4像素 * 2字节
+
+    def test_rgb565_color_accuracy(self):
+        """验证RGB565颜色转换精度"""
+        img = Image.new('RGB', (1, 1), (255, 0, 0))  # 纯红
+        data = image_to_rgb565_data(img)
+        pixel = struct.unpack('<H', data)[0]
+        assert pixel == 0xF800  # RGB565红色
+
+    def test_32x32_size(self):
+        """32x32图像应该产生2048字节"""
+        img = Image.new('RGB', (32, 32), (128, 128, 128))
+        data = image_to_rgb565_data(img)
+        assert len(data) == 32 * 32 * 2
 
 
 class TestRleCompress(unittest.TestCase):

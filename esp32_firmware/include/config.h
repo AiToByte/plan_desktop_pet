@@ -87,4 +87,13 @@
 #define PROX_COOLDOWN_MS        2000    // 接近事件冷却时间（防抖）
 #define PROX_WAKE_DURATION_MS   15000   // 接近唤醒后亮屏时长
 
+// ============ BH1750光照传感器配置 ============
+#define BH1750_SDA_PIN          41      // I2C SDA引脚
+#define BH1750_SCL_PIN          42      // I2C SCL引脚
+#define BH1750_READ_INTERVAL    2000    // 光照读取间隔(ms)
+
+// ============ DRV2605L触觉反馈配置 ============
+#define HAPTIC_SDA_PIN          41      // 与BH1750共享I2C总线
+#define HAPTIC_SCL_PIN          42
+
 #endif // CONFIG_H

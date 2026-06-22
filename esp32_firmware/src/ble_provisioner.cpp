@@ -12,6 +12,8 @@
 
 #include "ble_provisioner.h"
 
+#ifdef BLE_PROVISIONING_ENABLED  // 条件编译：未定义时整个模块不参与编译
+
 // Service UUID: 0x1820 (自定义)
 static NimBLEUUID SERVICE_UUID("1820");
 // Characteristic UUIDs
@@ -231,3 +233,5 @@ void BLEProvisioner::stop() {
     NimBLEDevice::deinit(true);  // true = release memory
     Serial.println("[BLE] Stopped, memory released");
 }
+
+#endif // BLE_PROVISIONING_ENABLED

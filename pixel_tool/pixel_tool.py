@@ -17,7 +17,7 @@ from pxl_sender import send_pxl_to_esp32, send_pixel_command
 
 
 def cmd_convert(args: Any) -> int:
-    """转换命令：图片/GIF -> .pxl"""
+    """转换命令：图片/GIF -> .pxl（带进度条）"""
     src = Path(args.input)
     if not src.exists():
         print(f"[ERR] 文件不存在: {src}")
@@ -25,15 +25,29 @@ def cmd_convert(args: Any) -> int:
     out = args.output
     size = (args.width, args.height)
 
-    if src.suffix.lower() == '.gif':
-        gif_to_pxl(str(src), out, size, args.max_frames, args.loop)
-    elif src.suffix.lower() in ('.png', '.jpg', '.jpeg', '.bmp', '.webp'):
-        if args.sprite:
-            png_to_pxl_frames(str(src), out, size, args.interval)
+    # 简易进度回调
+    def progress_cb(current: int, total: int):
+        if total > 0:
+            pct = current * 100 // total
+            bar_len = 30
+            filled = bar_len * current // total
+            bar = '█' * filled + '░' * (bar_len - filled)
+            print(f"\r[{bar}] {pct}% ({current}/{total}帧)", end='', flush=True)
+
+    try:
+        if src.suffix.lower() == '.gif':
+            gif_to_pxl(str(src), out, size, args.max_frames, args.loop, progress_cb=progress_cb)
+        elif src.suffix.lower() in ('.png', '.jpg', '.jpeg', '.bmp', '.webp'):
+            if args.sprite:
+                png_to_pxl_frames(str(src), out, size, args.interval, progress_cb=progress_cb)
+            else:
+                image_to_pxl(str(src), out, size, args.interval, args.loop)
         else:
-            image_to_pxl(str(src), out, size, args.interval, args.loop)
-    else:
-        print(f"[ERR] 不支持的格式: {src.suffix}")
+            print(f"[ERR] 不支持的格式: {src.suffix}")
+            return 1
+        print()  # 换行结束进度条
+    except Exception as e:
+        print(f"\n[ERR] 转换失败: {e}")
         return 1
     return 0
 

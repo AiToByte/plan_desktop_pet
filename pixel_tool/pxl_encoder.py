@@ -3,6 +3,7 @@ PXL 像素编码器
 将图片/GIF 转换为 .pxl 二进制像素文件
 """
 import struct
+import numpy as np
 from pathlib import Path
 from PIL import Image
 
@@ -25,18 +26,17 @@ def rgb888_to_rgb565(r, g, b):
 
 
 def image_to_rgb565_data(img: Image.Image) -> bytes:
-    """将PIL图像转换为RGB565字节数据"""
+    """将PIL图像转换为RGB565字节数据（numpy向量化，比纯Python循环快10-50倍）"""
     img = img.convert('RGB')
-    pixels = img.load()
-    w, h = img.size
-    data = bytearray(w * h * 2)
-    for y in range(h):
-        for x in range(w):
-            r, g, b = pixels[x, y]
-            pixel = rgb888_to_rgb565(r, g, b)
-            offset = (y * w + x) * 2
-            struct.pack_into('<H', data, offset, pixel)
-    return bytes(data)
+    arr = np.array(img, dtype=np.uint8)  # shape: (H, W, 3)
+    if arr.ndim == 2:
+        # 1x1 或单行极端情况，PIL可能返回2D数组
+        arr = arr.reshape(1, 1, 3) if arr.size == 3 else arr.reshape(arr.shape[0], 1, 3)
+    r = arr[:, :, 0].astype(np.uint16)
+    g = arr[:, :, 1].astype(np.uint16)
+    b = arr[:, :, 2].astype(np.uint16)
+    rgb565 = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
+    return rgb565.astype(np.uint16).tobytes()
 
 
 def rle_compress(rgb565_data: bytes) -> bytes:
@@ -124,8 +124,8 @@ def image_to_pxl(image_path: str, output_path: str = None, size: tuple = DEFAULT
 
 
 def gif_to_pxl(gif_path: str, output_path: str = None, size: tuple = DEFAULT_SIZE,
-               max_frames: int = 16, loop: bool = True) -> str:
-    """将GIF动画转换为.pxl多帧文件"""
+               max_frames: int = 16, loop: bool = True, progress_cb=None) -> str:
+    """将GIF动画转换为.pxl多帧文件（支持progress_cb(current, total)回调）"""
     gif_path = Path(gif_path)
     if not gif_path.exists():
         raise FileNotFoundError(f"GIF不存在: {gif_path}")
@@ -154,7 +154,12 @@ def gif_to_pxl(gif_path: str, output_path: str = None, size: tuple = DEFAULT_SIZ
         interval = DEFAULT_INTERVAL
 
     header = create_pxl_header(size[0], size[1], len(frames), interval, flags=1 if loop else 0)
-    pixel_data = b''.join(image_to_rgb565_data(f) for f in frames)
+    pixel_frames = []
+    for i, f in enumerate(frames):
+        pixel_frames.append(image_to_rgb565_data(f))
+        if progress_cb:
+            progress_cb(i + 1, len(frames))
+    pixel_data = b''.join(pixel_frames)
 
     with open(output_path, 'wb') as f:
         f.write(header)
@@ -166,8 +171,8 @@ def gif_to_pxl(gif_path: str, output_path: str = None, size: tuple = DEFAULT_SIZ
 
 
 def png_to_pxl_frames(png_path: str, output_path: str = None, size: tuple = DEFAULT_SIZE,
-                      interval: int = DEFAULT_INTERVAL) -> str:
-    """将PNG雪碧图（水平排列的帧序列）转换为.pxl文件"""
+                      interval: int = DEFAULT_INTERVAL, progress_cb=None) -> str:
+    """将PNG雪碧图（水平排列的帧序列）转换为.pxl文件（支持progress_cb回调）"""
     png_path = Path(png_path)
     if not png_path.exists():
         raise FileNotFoundError(f"图片不存在: {png_path}")
@@ -191,7 +196,12 @@ def png_to_pxl_frames(png_path: str, output_path: str = None, size: tuple = DEFA
         frames.append(frame)
 
     header = create_pxl_header(size[0], size[1], len(frames), interval, flags=1)
-    pixel_data = b''.join(image_to_rgb565_data(f) for f in frames)
+    pixel_frames = []
+    for i, f in enumerate(frames):
+        pixel_frames.append(image_to_rgb565_data(f))
+        if progress_cb:
+            progress_cb(i + 1, len(frames))
+    pixel_data = b''.join(pixel_frames)
 
     with open(output_path, 'wb') as f:
         f.write(header)
