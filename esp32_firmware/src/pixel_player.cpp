@@ -240,22 +240,26 @@ bool PixelPlayer::rleDecompress(const uint8_t* compressed, size_t compLen, uint1
     while (oi < pixelCount && ci < compLen) {
         uint8_t flag = compressed[ci++];
         if (flag & 0x80) {
-            // Run-length: 重复同一个像素
+            // Run-length: 重复同一个像素 (bounds check hoisted out of loop)
             uint8_t count = flag & 0x7F;
             if (ci + 2 > compLen) return false;
             uint16_t pixel = ((uint16_t)compressed[ci] << 8) | compressed[ci + 1]; // big-endian
             ci += 2;
-            for (uint8_t i = 0; i < count && oi < pixelCount; i++) {
-                output[oi++] = pixel;
-            }
+            if (oi + count > pixelCount) count = pixelCount - oi;
+            uint16_t* dst = output + oi;
+            for (uint8_t i = 0; i < count; i++) dst[i] = pixel;
+            oi += count;
         } else {
-            // Literal: 直接拷贝原始像素
+            // Literal: 直接拷贝原始像素 (bounds check hoisted, pointer write)
             uint8_t count = flag;
             if (ci + count * 2 > compLen) return false;
-            for (uint8_t i = 0; i < count && oi < pixelCount; i++) {
-                output[oi++] = ((uint16_t)compressed[ci] << 8) | compressed[ci + 1];
+            if (oi + count > pixelCount) count = pixelCount - oi;
+            uint16_t* dst = output + oi;
+            for (uint8_t i = 0; i < count; i++) {
+                dst[i] = ((uint16_t)compressed[ci] << 8) | compressed[ci + 1];
                 ci += 2;
             }
+            oi += count;
         }
     }
     return (oi == pixelCount);

@@ -44,12 +44,14 @@ class TokenHistory:
         self._lock = threading.Lock()
 
     def append(self, ts: float, inp: int, out: int):
+        """追加一条Token使用记录"""
         with self._lock:
             self.timestamps.append(ts)
             self.input_tokens.append(inp)
             self.output_tokens.append(out)
 
     def get_recent(self, n=60):
+        """获取最近n条Token记录"""
         with self._lock:
             n = min(n, len(self.timestamps))
             return (
@@ -235,6 +237,7 @@ class TrayApp:
         self.on_exit_callback = on_exit_callback
 
     def show_panel(self):
+        """显示/隐藏Agent指标面板"""
         if self.panel is None or not self.panel.winfo_exists():
             self.panel = StatusPanel(self.root, self.token_history)
         else:
@@ -287,6 +290,7 @@ if __name__ == '__main__':
 
     # 模拟数据（测试用）
     def simulate():
+        """模拟Agent数据更新（独立测试用）"""
         import random
         while True:
             app.update_metrics({

@@ -95,6 +95,7 @@ class WeatherService:
         self._cached_weather: Optional[Dict[str, Any]] = None
         self._last_update: float = 0.0
         self._agent_status: str = "idle"
+        self._session = requests.Session()
         self._load_cache()
     
     def set_agent_status(self, status: str):
@@ -155,7 +156,7 @@ class WeatherService:
                 "lang": "zh_cn"
             }
             
-            response = requests.get(
+            response = self._session.get(
                 self.BASE_URL, 
                 params=params, 
                 timeout=DEFAULT_API_TIMEOUT

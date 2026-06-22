@@ -186,8 +186,8 @@ class OTLPReceiver:
                 if receiver._health_callback:
                     try:
                         status.update(receiver._health_callback())
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"健康检查回调异常: {e}")
                 response = json.dumps(status)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")

@@ -206,32 +206,34 @@ class ThinkingChainTracker:
         自动重连：发送失败时关闭旧socket并重建一次
         """
         if not self._sock:
-            self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self._sock.settimeout(3.0)
-            self._sock.connect((self._esp32_host, self._esp32_port))
+            try:
+                self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self._sock.settimeout(3.0)
+                self._sock.connect((self._esp32_host, self._esp32_port))
+            except (ConnectionRefusedError, socket.timeout, OSError) as e:
+                logger.debug(f"[Thinking] 连接ESP32失败: {e}")
+                self._sock = None
+                return
         
         payload = json_str.encode("utf-8")
         header = f"LEN:{len(payload)}\n".encode("utf-8")
         try:
             self._sock.sendall(header + payload)
-        except (OSError, BrokenPipeError, ConnectionResetError):
-            # 连接已断，关闭旧socket并重建一次
+        except OSError as e:
+            logger.warning(f"[Thinking] sendall失败，清理连接: {e}")
             try:
                 self._sock.close()
             except Exception:
                 pass
-            self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self._sock.settimeout(3.0)
-            self._sock.connect((self._esp32_host, self._esp32_port))
-            self._sock.sendall(header + payload)
+            self._sock = None
     
     def close(self):
         """关闭连接"""
         if self._sock:
             try:
                 self._sock.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"关闭socket异常: {e}")
             self._sock = None
 
 

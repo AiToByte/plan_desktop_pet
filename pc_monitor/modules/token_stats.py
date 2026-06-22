@@ -97,6 +97,13 @@ class LogTailer:
 class TokenTracker:
     """Token使用追踪器"""
     
+    # 预编译正则模式（避免每次解析log行时重新编译）
+    _TOKEN_PATTERNS = [
+        re.compile(r'tokens?:\s*input[=:]\s*(\d+)\s*output[=:]\s*(\d+)', re.IGNORECASE),
+        re.compile(r'prompt_tokens?[=:]\s*(\d+).*?completion_tokens?[=:]\s*(\d+)', re.IGNORECASE),
+        re.compile(r'input_tokens[=:]\s*(\d+).*?output_tokens[=:]\s*(\d+)', re.IGNORECASE),
+    ]
+    
     # 价格模型 (USD per 1M tokens)
     PRICING = {
         "claude-3-opus": {"input": 15.0, "output": 75.0},
@@ -180,18 +187,12 @@ class TokenTracker:
                     "input_tokens": int(usage.get("input_tokens", 0)),
                     "output_tokens": int(usage.get("output_tokens", 0))
                 }
-        except (json.JSONDecodeError, AttributeError, ValueError):
-            pass
+        except (json.JSONDecodeError, AttributeError, ValueError) as e:
+            logger.debug(f"解析Token统计数据失败: {e}")
         
-        # fallback: 正则匹配纯文本格式
-        patterns = [
-            r'tokens?:\s*input[=:]\s*(\d+)\s*output[=:]\s*(\d+)',
-            r'prompt_tokens?[=:]\s*(\d+).*?completion_tokens?[=:]\s*(\d+)',
-            r'input_tokens[=:]\s*(\d+).*?output_tokens[=:]\s*(\d+)',
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, line, re.IGNORECASE)
+        # fallback: 正则匹配纯文本格式（使用类级预编译模式）
+        for pattern in self._TOKEN_PATTERNS:
+            match = pattern.search(line)
             if match:
                 return {
                     "input_tokens": int(match.group(1)),

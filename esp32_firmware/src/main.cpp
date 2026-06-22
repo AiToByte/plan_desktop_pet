@@ -68,6 +68,9 @@ std::atomic<uint8_t*> g_pendingPixelBufferPtr{nullptr};
 std::atomic<PixelPlayer*> g_pendingPixelPtr{nullptr};
 std::atomic<size_t> g_pendingPixelSize{0};
 
+// OTA升级时挂起渲染任务，释放Core 1的SPI总线+CPU
+TaskHandle_t g_renderTaskHandle = NULL;
+
 // ============ 前向声明 ============
 void parseServerData(String json);
 uint8_t parseStatus(String status);
@@ -144,16 +147,19 @@ void commTask(void* pvParameters) {
             }
         }
         
-        // 检查连接状态
-        if (!comm.isConnected() && wifi.isConnected()) {
-            // 断连时清理像素状态
-            // 断连时重置像素池状态（无需free，静态池常驻）
+        // 检查连接状态（边沿触发：仅在断连瞬间执行一次，避免每10ms狂锁reconnect）
+        static bool wasConnected = false;
+        bool nowConnected = comm.isConnected();
+        if (wasConnected && !nowConnected && wifi.isConnected()) {
+            // 下降沿：刚断连 → 清理像素状态 + 尝试重连
             g_pxlBuffer = g_pxlPool;
             g_pxlCapacity = 0;
             g_pxlOffset = 0;
             g_pendingNormalMode = true;  // Core 1将执行display.setNormalMode()
             comm.reconnect();
+            Serial.println("[CommTask] 连接断开(边沿触发)，已发起重连");
         }
+        wasConnected = nowConnected;
         
         // 定时心跳
         if (now - lastHeartbeat >= 10000) {
@@ -231,7 +237,7 @@ void commTask(void* pvParameters) {
 // ============ 渲染任务 (Core 1) ============
 void renderTask(void* pvParameters) {
     Serial.println("[RenderTask] Started on Core 1");
-    display.setupVSync();  // 初始化TE同步（硬件中断或软件自适应）
+    g_renderTaskHandle = xTaskGetCurrentTaskHandle();  // 供OTA等场景挂起用
     unsigned long lastDisplayUpdate = 0;
     unsigned long lastAnimationUpdate = 0;
     
@@ -335,6 +341,9 @@ void renderTask(void* pvParameters) {
             // 静态PSRAM池无需free（Core 1加载后数据已复制到PixelPlayer内部）
             g_pendingPixelBufferLoad = false;
         }
+        
+        // ===== VSync垂直同步：等待TE信号，避免撕裂 =====
+        display.waitForVSync(20);  // 最多等20ms，无TE引脚时自动退化为非阻塞
         
         // ===== 显示更新 =====
         display.waitForVSync();  // 等待TE信号/软件帧间隔，防止撕裂

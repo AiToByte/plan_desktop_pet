@@ -556,10 +556,21 @@ void WebConfig::handleOTAUpload() {
 
     if (upload.status == UPLOAD_FILE_START) {
         Serial.printf("[OTA] Start: %s\n", upload.filename.c_str());
+        // 挂起渲染任务，释放Core 1的SPI总线+CPU给OTA
+        extern TaskHandle_t g_renderTaskHandle;
+        if (g_renderTaskHandle) {
+            vTaskSuspend(g_renderTaskHandle);
+            Serial.println("[OTA] RenderTask suspended for firmware update");
+        }
         // 记录当前运行分区，用于回滚
         _otaPrevPartition = esp_ota_get_running_partition();
         if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
             Update.printError(Serial);
+            // Update.begin失败，恢复渲染任务
+            if (g_renderTaskHandle) {
+                vTaskResume(g_renderTaskHandle);
+                Serial.println("[OTA] RenderTask resumed (Update.begin failed)");
+            }
         }
     }
     else if (upload.status == UPLOAD_FILE_WRITE) {
@@ -568,6 +579,12 @@ void WebConfig::handleOTAUpload() {
         }
     }
     else if (upload.status == UPLOAD_FILE_END) {
+        // 恢复渲染任务（无论成功失败都恢复，避免永久挂起）
+        extern TaskHandle_t g_renderTaskHandle;
+        if (g_renderTaskHandle) {
+            vTaskResume(g_renderTaskHandle);
+            Serial.println("[OTA] RenderTask resumed");
+        }
         if (Update.end(true)) {
             Serial.printf("[OTA] Success: %u bytes\n", upload.totalSize);
             // 标记OTA应用镜像有效，取消回滚

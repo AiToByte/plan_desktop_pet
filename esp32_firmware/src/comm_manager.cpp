@@ -232,7 +232,8 @@ void CommManager::processData(const String& data_) {
     _lastReceiveTime = millis();
     
     Serial.print("[Comm] Received: ");
-    Serial.println(data.substring(0, 50) + "...");
+    Serial.print(data.substring(0, 50));
+    Serial.println("...");
 }
 
 bool CommManager::isConnected() {
@@ -257,7 +258,7 @@ void CommManager::sendFramed(const String& json) {
 }
 
 void CommManager::sendHeartbeat() {
-    DynamicJsonDocument doc(128);
+    StaticJsonDocument<256>;
     doc["type"] = "heartbeat";
     doc["ts"] = millis();
     
@@ -267,7 +268,7 @@ void CommManager::sendHeartbeat() {
 }
 
 void CommManager::sendMessage(String type, JsonObject data) {
-    DynamicJsonDocument doc(512);
+    StaticJsonDocument<768>;
     doc["type"] = type;
     doc["data"] = data;
     doc["ts"] = millis();

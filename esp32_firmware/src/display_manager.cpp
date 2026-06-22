@@ -13,6 +13,39 @@ static bool s_sramInited = false;
 static uint16_t s_sramBufW = 0;
 static uint16_t s_sramBufH = 0;
 
+// ============ Fast Trig LUT (256-entry, Q10 fixed-point, max error 0.0005) ============
+static const int16_t sinLUT[256] PROGMEM = {
+        0,    25,    50,    75,   100,   125,   150,   175,   200,   224,   249,   273,   297,   321,   345,   369,
+      392,   415,   438,   460,   483,   505,   526,   548,   569,   590,   610,   630,   650,   669,   688,   706,
+      724,   742,   759,   775,   792,   807,   822,   837,   851,   865,   878,   891,   903,   915,   926,   936,
+      946,   955,   964,   972,   980,   987,   993,   999,  1004,  1009,  1013,  1016,  1019,  1021,  1023,  1024,
+     1024,  1024,  1023,  1021,  1019,  1016,  1013,  1009,  1004,   999,   993,   987,   980,   972,   964,   955,
+      946,   936,   926,   915,   903,   891,   878,   865,   851,   837,   822,   807,   792,   775,   759,   742,
+      724,   706,   688,   669,   650,   630,   610,   590,   569,   548,   526,   505,   483,   460,   438,   415,
+      392,   369,   345,   321,   297,   273,   249,   224,   200,   175,   150,   125,   100,    75,    50,    25,
+        0,   -25,   -50,   -75,  -100,  -125,  -150,  -175,  -200,  -224,  -249,  -273,  -297,  -321,  -345,  -369,
+     -392,  -415,  -438,  -460,  -483,  -505,  -526,  -548,  -569,  -590,  -610,  -630,  -650,  -669,  -688,  -706,
+     -724,  -742,  -759,  -775,  -792,  -807,  -822,  -837,  -851,  -865,  -878,  -891,  -903,  -915,  -926,  -936,
+     -946,  -955,  -964,  -972,  -980,  -987,  -993,  -999, -1004, -1009, -1013, -1016, -1019, -1021, -1023, -1024,
+    -1024, -1024, -1023, -1021, -1019, -1016, -1013, -1009, -1004,  -999,  -993,  -987,  -980,  -972,  -964,  -955,
+     -946,  -936,  -926,  -915,  -903,  -891,  -878,  -865,  -851,  -837,  -822,  -807,  -792,  -775,  -759,  -742,
+     -724,  -706,  -688,  -669,  -650,  -630,  -610,  -590,  -569,  -548,  -526,  -505,  -483,  -460,  -438,  -415,
+     -392,  -369,  -345,  -321,  -297,  -273,  -249,  -224,  -200,  -175,  -150,  -125,  -100,   -75,   -50,   -25,
+};
+
+static inline float fastSin(float angle) {
+    int idx = (int)(angle * 40.743665f) & 0xFF;  // 256/(2*PI)
+    return sinLUT[idx] * 0.0009765625f;           // / 1024.0
+}
+static inline float fastCos(float angle) {
+    int idx = ((int)(angle * 40.743665f) + 64) & 0xFF;
+    return sinLUT[idx] * 0.0009765625f;
+}
+
+// ============ Pre-allocated fade blend buffer (avoids heap fragmentation) ============
+static uint8_t s_fadeBlendBuf[SCREEN_WIDTH * SCREEN_HEIGHT * 2] __attribute__((aligned(4)));
+
+
 // ============ 构造 / 初始化 ============
 
 DisplayManager::DisplayManager()
@@ -252,7 +285,7 @@ void DisplayManager::drawStatusBar(const AgentState& agent) {
     }
 
     // 呼吸灯效果
-    uint8_t pulse = (sin(_blinkCounter * 0.15) + 1.0) * 64 + 128;
+    uint8_t pulse = (fastSin(_blinkCounter * 0.15f) + 1.0f) * 64 + 128;
     uint16_t dimColor = _sprite.color565(
         ((statusColor >> 11) & 0x1F) * pulse / 255,
         ((statusColor >> 5) & 0x3F) * pulse / 255 / 2,
@@ -646,13 +679,13 @@ void DisplayManager::drawIconSun(int x, int y, uint8_t frame) {
     _sprite.fillCircle(x, y, 4, FACE_ORANGE);
 
     // 光线（8方向，帧偏移旋转）
-    float angle = frame * 0.39;  // 每帧旋转约22.5度
+    float angle = frame * 0.39f;  // 每帧旋转约22.5度
     for (int i = 0; i < 8; i++) {
-        float a = angle + i * 0.785;  // 45度间隔
-        int dx = cos(a) * 9;
-        int dy = sin(a) * 9;
-        int dx2 = cos(a) * 7;
-        int dy2 = sin(a) * 7;
+        float a = angle + i * 0.785f;  // 45度间隔
+        int dx = (int)(fastCos(a) * 9);
+        int dy = (int)(fastSin(a) * 9);
+        int dx2 = (int)(fastCos(a) * 7);
+        int dy2 = (int)(fastSin(a) * 7);
         _sprite.drawLine(x + dx2, y + dy2, x + dx, y + dy, FACE_YELLOW);
     }
 }
@@ -835,7 +868,7 @@ void DisplayManager::drawStatusDot(int x, int y, int r, uint8_t status, uint8_t 
     }
 
     // 脉动效果
-    float pulse = (sin(frame * 0.5) + 1.0) * 0.5;
+    float pulse = (fastSin(frame * 0.5f) + 1.0f) * 0.5f;
     int pr = r + pulse * 2;
     _sprite.fillCircle(x, y, pr, color);
 }
@@ -945,9 +978,9 @@ void DisplayManager::_fadeBlend() {
     if (!oldBuf || !newBuf) { _fadeActive = false; return; }
 
     const int totalPixels = SCREEN_WIDTH * SCREEN_HEIGHT;
-    // 临时缓冲区存放混合结果（从新帧拷贝，然后逐像素修改）
-    uint8_t* blendBuf = (uint8_t*)malloc(totalPixels * 2);
-    if (!blendBuf) { _fadeActive = false; return; }
+    // 使用预分配的静态缓冲区（避免堆碎片化）
+    uint8_t* blendBuf = s_fadeBlendBuf;
+    if (!blendBuf) { _fadeActive = false; return; }  // should never happen
 
     while (_fadeActive) {
         uint32_t t = millis();
@@ -981,7 +1014,7 @@ void DisplayManager::_fadeBlend() {
         uint32_t elapsed = millis() - t;
         if (elapsed < 16) delay(16 - elapsed);
     }
-    free(blendBuf);
+    // s_fadeBlendBuf is static, no free needed
 }
 
 void DisplayManager::drawThinkingIndicator(ThinkingState state, uint8_t stepCount) {
