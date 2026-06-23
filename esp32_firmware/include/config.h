@@ -44,6 +44,7 @@
 #define SCREEN_WIDTH  240
 #define SCREEN_HEIGHT 240
 #define SCREEN_ROTATION 0
+#define LCD_BRIGHTNESS  200    // LCD背光亮度 (0-255)
 
 // 显示更新间隔 (ms)
 #define UPDATE_INTERVAL 1000

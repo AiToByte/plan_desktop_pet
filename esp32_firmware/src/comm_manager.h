@@ -51,6 +51,7 @@ private:
     int _expectedLen;        // 期望的payload长度
     
     void processData(const String& data);
+public:
     void sendFramed(const String& json);  // 发送带长度前缀的帧
 };
 

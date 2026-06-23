@@ -102,6 +102,11 @@ class SerialCommunication(CommunicationBase):
         super().__init__()
         self.port = config.get("serial_port", DEFAULT_SERIAL_PORT)
         self.baudrate = config.get("serial_baud", DEFAULT_SERIAL_BAUD)
+        # [FIX-N7] 波特率校验：拒绝非法值，防止连接时抛出不明确异常
+        _valid_baudrates = {300, 1200, 2400, 4800, 9600, 19200, 38400, 57600,
+                           115200, 230400, 460800, 921600, 1500000, 2000000}
+        if self.baudrate not in _valid_baudrates:
+            logger.warning(f"非标准波特率 {self.baudrate}, 已知值: {_valid_baudrates}")
         self._serial: Optional[serial.Serial] = None
         self._read_thread: Optional[threading.Thread] = None
     
@@ -385,7 +390,7 @@ class WiFiCommunication(CommunicationBase):
                 try:
                     udp_sock.close()
                 except Exception as e:
-                    logger.debug(f"关闭UDP socket失败: {e}")
+                    logger.warning(f"关闭UDP socket失败: {e}")
         logger.info("UDP广播已停止")
     
     def disconnect(self):
@@ -408,6 +413,13 @@ class WiFiCommunication(CommunicationBase):
                 except Exception as e:
                     logger.debug(f"关闭服务端socket失败: {e}")
                 self._server_socket = None
+
+        # [FIX-C1] 等待UDP广播线程退出，防止快速启停时线程/端口泄漏
+        if self._udp_broadcast_thread and self._udp_broadcast_thread.is_alive():
+            self._udp_broadcast_thread.join(timeout=5)
+            if self._udp_broadcast_thread.is_alive():
+                logger.warning("UDP广播线程未在5秒内退出")
+        self._udp_broadcast_thread = None
         
         logger.info("TCP Server 已关闭")
     
@@ -556,6 +568,10 @@ class WiFiCommunication(CommunicationBase):
                         if line.startswith("LEN:"):
                             try:
                                 expected_len = int(line[4:])
+                                # [FIX-C3] 帧长度上限检查：防止恶意/损坏LEN头导致OOM
+                                if expected_len <= 0 or expected_len > 256 * 1024:
+                                    logger.warning(f"帧长度越界: {expected_len}, 丢弃")
+                                    expected_len = None
                             except ValueError:
                                 logger.warning(f"Invalid LEN line: {line}")
                         elif line.strip():

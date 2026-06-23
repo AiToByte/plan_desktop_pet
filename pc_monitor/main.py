@@ -90,7 +90,7 @@ class DesktopPetMonitor:
                 for err in errors:
                     logger.warning(f"配置验证警告: {err}")
             return config
-        except Exception as e:
+        except (FileNotFoundError, json.JSONDecodeError, PermissionError) as e:
             logger.error(f"加载配置失败: {e}")
             return {}
     
@@ -225,7 +225,7 @@ class DesktopPetMonitor:
         if self._tray_app:
             try:
                 self._tray_app.update_metrics(data)
-            except Exception as e:
+            except (AttributeError, TypeError) as e:
                 logger.debug(f"Tray update error: {e}")
 
     def _periodic_update(self) -> None:

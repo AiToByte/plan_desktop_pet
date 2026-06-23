@@ -21,6 +21,7 @@
  */
 
 #include "haptic_driver.h"
+#include "log.h"
 
 // DRV2605L寄存器地址
 static constexpr uint8_t REG_STATUS    = 0x00;
@@ -50,7 +51,8 @@ static constexpr uint8_t MODE_SEQUENCE = 0x05;
 // ====== 构造/析构 ======
 
 HapticDriver::HapticDriver()
-    : _available(false), _motorType(1) {  // 默认LRA
+    : _wire(0),  // 使用I2C总线0
+      _available(false), _motorType(1) {  // 默认LRA
 }
 
 HapticDriver::~HapticDriver() {
@@ -65,7 +67,7 @@ bool HapticDriver::begin(int sdaPin, int sclPin) {
     // 检测传感器
     _wire.beginTransmission(DRV2605_ADDR);
     if (_wire.endTransmission() != 0) {
-        Serial.println("[Haptic] DRV2605L not found on I2C bus");
+        LOG_I("DRV2605L not found on I2C bus");
         _available = false;
         return false;
     }
@@ -90,7 +92,7 @@ bool HapticDriver::begin(int sdaPin, int sclPin) {
     _writeRegister(REG_CONTROL3, 0xA0);
     
     _available = true;
-    Serial.println("[Haptic] DRV2605L initialized (LRA mode, Library 6)");
+    LOG_I("DRV2605L initialized (LRA mode, Library 6)");
     
     // 自动校准LRA参数
     calibrate();
@@ -102,7 +104,7 @@ bool HapticDriver::begin(int sdaPin, int sclPin) {
     _writeRegister(REG_CONTROL2, 0xF5);
     _writeRegister(REG_CONTROL3, 0xA0);
     
-    Serial.println("[Haptic] Ready for playback");
+    LOG_I("Ready for playback");
     return true;
 }
 
@@ -147,15 +149,14 @@ bool HapticDriver::calibrate() {
         if ((go & 0x01) == 0) {
             // 校准完成，读取诊断结果
             uint8_t diag = _readRegister(REG_STATUS);
-            Serial.printf("[Haptic] Calibration done. Status=0x%02X (0x00=OK)
-", diag);
+            LOG_I("Calibration done. Status=0x%02X (0x00=OK)\n", diag);
             _available = true;
             return true;
         }
         delay(50);
     }
 
-    Serial.println("[Haptic] Calibration TIMEOUT (>1500ms)");
+    LOG_W("Calibration TIMEOUT (>1500ms)");
     _available = false;
     return false;
 }

@@ -69,6 +69,10 @@ private:
     class PasswordCallback;
     class HostCallback;
     class PortCallback;
+
+    // 内部辅助方法
+    bool initBLEService();
+    bool waitForProvisioning();
 };
 
 #endif // BLE_PROVISIONING_ENABLED

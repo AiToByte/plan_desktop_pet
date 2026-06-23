@@ -105,6 +105,14 @@ public:
     void sleep();    // 关闭背光（深度休眠）
     void wakeup();   // 恢复全亮
 
+    // 亮度控制（一阶缓动）
+    void setBrightness(uint8_t brightness) { _targetBrightness = brightness; }
+    void setBrightnessImmediate(uint8_t brightness) { _lcd.setBrightness(brightness); _currentBrightness = (float)brightness; _targetBrightness = brightness; }
+    void applySmoothBacklight();  // 每帧调用，平滑过渡亮度
+
+    // True Night Shift 色温矩阵
+    uint16_t nightShiftColor(uint16_t color) const;  // 对单个RGB565色应用暖色偏移
+
     // 像素模式控制
     void setPixelMode(PixelPlayer* player);   // 进入自定义像素模式
     void setNormalMode();                       // 返回正常模式
@@ -145,6 +153,11 @@ private:
 
     // 夜览色温（0.0=正常，1.0=最大暖色）
     float _nightWarmth = 0.0f;
+
+    // 一阶缓动背光控制
+    uint8_t _targetBrightness = LCD_BRIGHTNESS;
+    float _currentBrightness = (float)LCD_BRIGHTNESS;
+    static constexpr float BRIGHTNESS_SMOOTHING = 0.15f;  // EMA系数，越小越平滑
 
     // 模式切换淡入淡出
     LGFX_Sprite _transitionSprite;   // 旧帧缓存（用于alpha混合）
@@ -224,10 +237,11 @@ private:
     // === V-Sync TE同步 ===
     // 当LCD_TE_PIN >= 0时启用硬件TE中断同步
     // 当LCD_TE_PIN == -1时使用软件自适应帧率控制
-    volatile bool _teReceived = false;
-    static void IRAM_ATTR _teIsrHandler(void* arg);
-    void waitForVSync();
+    static volatile bool s_teTriggered;
+    static void IRAM_ATTR _teIsrHandler();
     void setupVSync();
+public:
+    void waitForVSync(uint32_t timeout_ms = 20);
     unsigned long _lastFrameTime = 0;  // 软件帧率控制 fallback
     unsigned long _frameIntervalMs = 33; // 目标帧间隔 (~30fps)
 };

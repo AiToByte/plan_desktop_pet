@@ -282,8 +282,7 @@ class TestFetchWeather(unittest.TestCase):
         result = self.service.fetch_weather()
         self.assertIsNotNone(result)
 
-    @patch('modules.weather.requests.get')
-    def test_fetch_api_success(self, mock_get):
+    def test_fetch_api_success(self):
         """L150-170: API请求成功"""
         mock_response = MagicMock()
         mock_response.json.return_value = {
@@ -293,67 +292,56 @@ class TestFetchWeather(unittest.TestCase):
             "wind": {"speed": 5}
         }
         mock_response.raise_for_status = MagicMock()
-        mock_get.return_value = mock_response
-
-        result = self.service.fetch_weather()
+        with patch.object(self.service._session, 'get', return_value=mock_response):
+            result = self.service.fetch_weather()
         self.assertIsNotNone(result)
         self.assertEqual(result.city, "Shanghai")
         self.assertAlmostEqual(result.temperature, 30)
         self.assertIsNotNone(self.service._cached_weather)
 
-    @patch('modules.weather.requests.get')
-    def test_fetch_timeout_with_cache(self, mock_get):
+    def test_fetch_timeout_with_cache(self):
         """L172-184: 超时时降级到缓存"""
-        mock_get.side_effect = Timeout("timeout")
         cached = {"name": "Cached", "main": {"temp": 18}, "weather": [{}], "wind": {}}
         self.service._cached_weather = cached
         self.service._last_update = 0  # 过期缓存
-
-        result = self.service.fetch_weather()
+        with patch.object(self.service._session, 'get', side_effect=Timeout("timeout")):
+            result = self.service.fetch_weather()
         self.assertIsNotNone(result)
         self.assertEqual(result.city, "Cached")
 
-    @patch('modules.weather.requests.get')
-    def test_fetch_timeout_no_cache(self, mock_get):
+    def test_fetch_timeout_no_cache(self):
         """L172-185: 超时无缓存时返回模拟数据"""
-        mock_get.side_effect = Timeout("timeout")
         self.service._cached_weather = None
-
-        result = self.service.fetch_weather()
+        with patch.object(self.service._session, 'get', side_effect=Timeout("timeout")):
+            result = self.service.fetch_weather()
         self.assertIsNotNone(result)
         self.assertEqual(result.city, "Shanghai")  # mock weather
 
-    @patch('modules.weather.requests.get')
-    def test_fetch_request_exception(self, mock_get):
+    def test_fetch_request_exception(self):
         """L174-175: RequestException降级到缓存"""
-        mock_get.side_effect = RequestException("network error")
         cached = {"name": "Cached", "main": {"temp": 15}, "weather": [{}], "wind": {}}
         self.service._cached_weather = cached
         self.service._last_update = 0
-
-        result = self.service.fetch_weather()
+        with patch.object(self.service._session, 'get', side_effect=RequestException("network error")):
+            result = self.service.fetch_weather()
         self.assertIsNotNone(result)
 
-    @patch('modules.weather.requests.get')
-    def test_fetch_value_error(self, mock_get):
+    def test_fetch_value_error(self):
         """L176-177: ValueError降级到缓存"""
         mock_response = MagicMock()
         mock_response.raise_for_status = MagicMock()
         mock_response.json.side_effect = ValueError("bad json")
-        mock_get.return_value = mock_response
         self.service._cached_weather = {"name": "X", "main": {}, "weather": [{}], "wind": {}}
         self.service._last_update = 0
-
-        result = self.service.fetch_weather()
+        with patch.object(self.service._session, 'get', return_value=mock_response):
+            result = self.service.fetch_weather()
         self.assertIsNotNone(result)
 
-    @patch('modules.weather.requests.get')
-    def test_fetch_unknown_exception(self, mock_get):
+    def test_fetch_unknown_exception(self):
         """L178-179: 未知异常降级"""
-        mock_get.side_effect = RuntimeError("unexpected")
         self.service._cached_weather = None
-
-        result = self.service.fetch_weather()
+        with patch.object(self.service._session, 'get', side_effect=RuntimeError("unexpected")):
+            result = self.service.fetch_weather()
         self.assertIsNotNone(result)  # mock weather
 
     def test_fetch_cache_expired_by_working_status(self):

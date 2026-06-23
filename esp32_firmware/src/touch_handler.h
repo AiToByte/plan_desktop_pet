@@ -32,6 +32,8 @@ private:
     bool _isNear;
     unsigned long _lastEventTime;
     unsigned long _lastNearTime;  // 最近一次接近时间（用于wake duration）
+public:
+    unsigned long getLastNearTime() const { return _lastNearTime; }
 };
 
 class TouchHandler {

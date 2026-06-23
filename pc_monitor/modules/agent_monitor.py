@@ -239,16 +239,24 @@ class AgentMonitor:
         return False
     
     def get_state(self) -> AgentState:
-        """获取当前Agent状态"""
-        # 1. 验证缓存的进程是否依然存活
+        """获取当前Agent状态
+        
+        优化：优先使用轻量级PID存活检查（微秒级），仅在缓存失效时
+        才触发重度全量进程遍历，大幅降低PC端CPU开销。
+        """
+        # 1. 轻量级PID缓存验证：仅检查PID存活+进程名一致性
         if self._cached_proc:
             try:
-                if not self._cached_proc.is_running():
+                if self._cached_proc.is_running() and \
+                   any(t in self._cached_proc.name().lower() for t in self.process_names):
+                    pass  # 缓存有效，直接使用
+                else:
+                    logger.debug("PID缓存失效: 进程名不匹配或已退出")
                     self._cached_proc = None
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 self._cached_proc = None
 
-        # 2. 如果无缓存，则重新查找
+        # 2. 仅当缓存失效时，触发重度全量遍历
         if self._cached_proc is None:
             self._cached_proc = self._find_agent_process()
             self._cpu_history = deque(maxlen=CPU_HISTORY_WINDOW)

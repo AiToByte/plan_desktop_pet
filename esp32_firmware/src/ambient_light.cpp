@@ -13,11 +13,13 @@
  */
 
 #include "ambient_light.h"
+#include "log.h"
 
 // ====== 构造/析构 ======
 
 AmbientLightManager::AmbientLightManager()
-    : _available(false), _lastLux(0), _lastReadTime(0) {
+    : _wire(0),  // 使用I2C总线0
+      _available(false), _lastLux(0), _lastReadTime(0) {
 }
 
 AmbientLightManager::~AmbientLightManager() {
@@ -32,7 +34,7 @@ bool AmbientLightManager::begin(int sdaPin, int sclPin) {
     // 检测传感器是否响应
     _wire.beginTransmission(BH1750_ADDR);
     if (_wire.endTransmission() != 0) {
-        Serial.println("[Light] BH1750 not found on I2C bus");
+        LOG_I("BH1750 not found on I2C bus");
         _available = false;
         return false;
     }
@@ -44,7 +46,7 @@ bool AmbientLightManager::begin(int sdaPin, int sclPin) {
     delay(180);  // 首次测量需要120~180ms
     
     _available = true;
-    Serial.println("[Light] BH1750 initialized (continuous high-res)");
+    LOG_I("BH1750 initialized (continuous high-res)");
     return true;
 }
 
@@ -55,7 +57,7 @@ int16_t AmbientLightManager::readLux() {
     
     _wire.requestFrom((uint8_t)BH1750_ADDR, (uint8_t)2);
     if (_wire.available() < 2) {
-        Serial.println("[Light] BH1750 read failed");
+        LOG_E("BH1750 read failed");
         return -1;
     }
     
@@ -126,7 +128,7 @@ uint8_t AmbientLightManager::autoAdjustBacklight(int16_t lux) {
 void AmbientLightManager::powerDown() {
     if (!_available) return;
     _writeCommand(0x00);  // Power Down指令
-    Serial.println("[Light] BH1750 powered down");
+    LOG_I("BH1750 powered down");
 }
 
 void AmbientLightManager::powerUp() {
@@ -135,7 +137,7 @@ void AmbientLightManager::powerUp() {
     delay(10);
     _writeCommand(BH1750_CONT_HRES);
     delay(180);
-    Serial.println("[Light] BH1750 powered up");
+    LOG_I("BH1750 powered up");
 }
 
 // ====== 内部方法 ======

@@ -3,6 +3,16 @@
 
 #include <Arduino.h>
 
+// ============ 思考链状态 (OTLP可视化) ============
+enum ThinkingState : uint8_t {
+    THINK_IDLE = 0,
+    THINK_THINKING,
+    THINK_TOOL_CALL,
+    THINK_RESPONDING,
+    THINK_ERROR,
+    THINK_DONE
+};
+
 // Agent状态
 struct AgentState {
     uint8_t status;
@@ -40,17 +50,6 @@ struct DisplayData {
     WeatherInfo weather;
     uint32_t lastUpdate;
     bool connected;
-};
-
-
-// ============ 思考链状态 (OTLP可视化) ============
-enum ThinkingState : uint8_t {
-    THINK_IDLE = 0,
-    THINK_THINKING,
-    THINK_TOOL_CALL,
-    THINK_RESPONDING,
-    THINK_ERROR,
-    THINK_DONE
 };
 
 #endif // TYPES_H

@@ -6,10 +6,14 @@
 #include "display_manager.h"
 #include <math.h>
 #include <time.h>
+#include "log.h"
 
 // ============ SRAM切片缓冲（用于分块传输） ============
 static uint16_t s_sramSliceBuf[512] __attribute__((aligned(4))) __attribute__((section(".dram")));
 static bool s_sramInited = false;
+
+// V-Sync TE中断标志（定义在.h中声明）
+volatile bool DisplayManager::s_teTriggered = false;
 static uint16_t s_sramBufW = 0;
 static uint16_t s_sramBufH = 0;
 
@@ -67,13 +71,14 @@ void DisplayManager::begin() {
     _lcd.init();
     _lcd.setRotation(SCREEN_ROTATION);
     _sprite.fillScreen(COLOR_BG);
-    _lcd.setBrightness(200);
+    // 使用缓动系统初始化亮度（立即设置，避免启动时渐变）
+    setBrightnessImmediate(LCD_BRIGHTNESS);
 
     // 创建双缓冲离屏画布（与屏幕同尺寸）
     _sprite.deleteSprite();
     _sprite.createSprite(SCREEN_WIDTH, SCREEN_HEIGHT);
     _transitionSprite.createSprite(SCREEN_WIDTH, SCREEN_HEIGHT);  // 用于淡入淡出alpha混合
-    Serial.printf("[Display] Sprite buffer created: %dx%d\n", SCREEN_WIDTH, SCREEN_HEIGHT);
+    LOG_I("Sprite buffer created: %dx%d\n", SCREEN_WIDTH, SCREEN_HEIGHT);
 }
 
 void DisplayManager::showBootScreen(String message) {
@@ -129,7 +134,7 @@ void DisplayManager::update(const DisplayData& data) {
     _sprite.fillScreen(COLOR_BG);
     drawHeader();
     drawStatusBar(data.agent);
-    drawThinkingIndicator(data.thinkingState, 0);
+    drawThinkingIndicator(data.agent.thinkingState, 0);
     drawWeatherPanel(data.weather);
     drawTokenPanel(data.tokens);
     drawFaceAnimation();
@@ -171,7 +176,9 @@ void DisplayManager::updateAnimation() {
         drawFace(faceX, faceY, _currentFace, _animFrame);
 
         // 脏矩形：仅推送表情动画区域（约240×40 vs 全屏240×240，减少80% SPI传输）
-        _sprite.pushSprite(&_lcd, 0, faceY - 4, 0, faceY - 4, SCREEN_WIDTH, FACE_SIZE + 8);
+        _lcd.setClipRect(0, faceY - 4, SCREEN_WIDTH, FACE_SIZE + 8);
+        _sprite.pushSprite(&_lcd, 0, 0);
+        _lcd.clearClipRect();
     }
 }
 
@@ -179,7 +186,7 @@ void DisplayManager::updateAnimation() {
 
 void DisplayManager::setPixelMode(PixelPlayer* player) {
     if (!player || !player->isLoaded()) {
-        Serial.println("[Display] Cannot set pixel mode: player not ready");
+        LOG_I("Cannot set pixel mode: player not ready");
         return;
     }
     // 捕获当前帧作为fade旧帧
@@ -192,7 +199,7 @@ void DisplayManager::setPixelMode(PixelPlayer* player) {
     _fadeActive = true;
     _fadeFrame = 0;
     _fadeBlend();
-    Serial.println("[Display] Switched to PIXEL mode (fade)");
+    LOG_I("Switched to PIXEL mode (fade)");
 }
 
 void DisplayManager::setNormalMode() {
@@ -201,13 +208,13 @@ void DisplayManager::setNormalMode() {
     // 切换模式并立即绘制新内容
     _displayMode = MODE_NORMAL;
     _pixelPlayer = nullptr;
-    drawNormalFrame();
+    _sprite.fillScreen(COLOR_BG);  // 清屏，下一帧update()会重绘正常内容
     _lastAnimTime = 0;
     // 启动淡入淡出（旧→新）
     _fadeActive = true;
     _fadeFrame = 0;
     _fadeBlend();
-    Serial.println("[Display] Switched to NORMAL mode (fade)");
+    LOG_I("Switched to NORMAL mode (fade)");
 }
 
 void DisplayManager::drawPixelFrame() {
@@ -220,9 +227,9 @@ void DisplayManager::drawPixelFrame() {
     // === PSRAM→SRAM 桥接优化 ===
     // 将PSRAM帧数据以512B切片预拷贝到内部SRAM，
     // 避免DMA发送时SPI总线竞争导致的微卡顿。
-    // 注意: 仅在帧尺寸≤32x32时启用(>256KB帧不适合缓存)
+    // 注意: 仅在帧尺寸≤64KB时启用(>64KB帧不适合缓存)
     size_t frameBytes = (size_t)w * (size_t)h * 2;
-    if (frameBytes <= sizeof(s_sramSliceBuf) * 64) {  // 帧≤32KB
+    if (frameBytes <= sizeof(s_sramSliceBuf) * 64) {  // 帧≤64KB
         // 首次初始化或尺寸变化时更新标记
         if (!s_sramInited || s_sramBufW != w || s_sramBufH != h) {
             s_sramBufW = w;
@@ -306,11 +313,14 @@ void DisplayManager::drawStatusBar(const AgentState& agent) {
     _sprite.setTextColor(COLOR_TEXT);
     _sprite.drawString(agent.processName, 34, y + 24);
 
-    // CPU/内存 (右对齐)
+    // CPU/内存 (右对齐) - snprintf避免String堆分配
     _sprite.setTextDatum(middle_right);
     _sprite.setTextColor(COLOR_TEXT_DIM);
-    _sprite.drawString("CPU:" + String(_springCpu.current(), 1) + "%", SCREEN_WIDTH - 8, y + 8);
-    _sprite.drawString("MEM:" + String(_springMem.current(), 0) + "MB", SCREEN_WIDTH - 8, y + 24);
+    char buf[24];
+    snprintf(buf, sizeof(buf), "CPU:%.1f%%", _springCpu.current());
+    _sprite.drawString(buf, SCREEN_WIDTH - 8, y + 8);
+    snprintf(buf, sizeof(buf), "MEM:%.0fMB", _springMem.current());
+    _sprite.drawString(buf, SCREEN_WIDTH - 8, y + 24);
 }
 
 void DisplayManager::drawWeatherPanel(const WeatherInfo& weather) {
@@ -323,11 +333,13 @@ void DisplayManager::drawWeatherPanel(const WeatherInfo& weather) {
     // 天气图标 (左侧)
     drawWeatherIcon(weather.iconCode, 24, y + 22);
 
-    // 温度 (大号)
+    // 温度 (大号) - snprintf避免堆分配
     _sprite.setTextColor(COLOR_TEXT);
     _sprite.setTextSize(2);
     _sprite.setTextDatum(top_left);
-    _sprite.drawString(String(_springTemp.current(), 1) + "C", 48, y + 10);
+    char buf[20];
+    snprintf(buf, sizeof(buf), "%.1fC", _springTemp.current());
+    _sprite.drawString(buf, 48, y + 10);
 
     // 天气描述
     _sprite.setTextSize(1);
@@ -335,11 +347,13 @@ void DisplayManager::drawWeatherPanel(const WeatherInfo& weather) {
     _sprite.setTextColor(COLOR_TEXT_DIM);
     _sprite.drawString(weather.description, 48, y + 40);
 
-    // 湿度/风速 (右侧)
+    // 湿度/风速 (右侧) - snprintf避免堆分配
     _sprite.setTextDatum(middle_right);
     _sprite.setTextColor(COLOR_TEXT);
-    _sprite.drawString("H:" + String(weather.humidity) + "%", SCREEN_WIDTH - 12, y + 18);
-    _sprite.drawString("W:" + String(weather.windSpeed, 1) + "m/s", SCREEN_WIDTH - 12, y + 34);
+    snprintf(buf, sizeof(buf), "H:%d%%", weather.humidity);
+    _sprite.drawString(buf, SCREEN_WIDTH - 12, y + 18);
+    snprintf(buf, sizeof(buf), "W:%.1fm/s", weather.windSpeed);
+    _sprite.drawString(buf, SCREEN_WIDTH - 12, y + 34);
 
     // 城市 (底部居中)
     _sprite.setTextDatum(middle_center);
@@ -356,29 +370,34 @@ void DisplayManager::drawTokenPanel(const TokenStats& tokens) {
 
     _sprite.setTextSize(1);
 
-    // Token 总数
+    // Token 总数 - snprintf避免堆分配
     _sprite.setTextColor(COLOR_TEXT);
     _sprite.setTextDatum(middle_left);
     _sprite.drawString("Tokens:", 14, y + 14);
     _sprite.setTextColor(FACE_YELLOW);
-    _sprite.drawString(String((int)_springTokens.current()), 70, y + 14);
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%d", (int)_springTokens.current());
+    _sprite.drawString(buf, 70, y + 14);
 
     // 费用
     _sprite.setTextDatum(middle_right);
     _sprite.setTextColor(FACE_ORANGE);
-    _sprite.drawString("$" + String(tokens.costUSD, 2), SCREEN_WIDTH - 14, y + 14);
+    snprintf(buf, sizeof(buf), "$%.2f", tokens.costUSD);
+    _sprite.drawString(buf, SCREEN_WIDTH - 14, y + 14);
 
     // 请求数
     _sprite.setTextColor(COLOR_TEXT);
     _sprite.setTextDatum(middle_left);
     _sprite.drawString("Req:", 14, y + 32);
     _sprite.setTextColor(COLOR_TEXT_DIM);
-    _sprite.drawString(String(tokens.totalRequests), 48, y + 32);
+    snprintf(buf, sizeof(buf), "%d", tokens.totalRequests);
+    _sprite.drawString(buf, 48, y + 32);
 
     // 1小时Token
     _sprite.setTextDatum(middle_right);
     _sprite.setTextColor(COLOR_TEXT_DIM);
-    _sprite.drawString("1h:" + String(tokens.hourTokens), SCREEN_WIDTH - 14, y + 32);
+    snprintf(buf, sizeof(buf), "1h:%d", tokens.hourTokens);
+    _sprite.drawString(buf, SCREEN_WIDTH - 14, y + 32);
 }
 
 void DisplayManager::drawFaceAnimation() {
@@ -876,21 +895,36 @@ void DisplayManager::drawStatusDot(int x, int y, int r, uint8_t status, uint8_t 
 // ============ 屏幕休眠控制 ============
 
 void DisplayManager::dim() {
-    // 降低亮度到30%
-    _lcd.setBrightness(60);
-    Serial.println("[Display] Dimmed to 30%");
+    // 降低亮度到30%（通过缓动系统平滑过渡）
+    _targetBrightness = 60;
+    LOG_I("Dim target: 30%");
 }
 
 void DisplayManager::sleep() {
-    // 关闭背光
-    _lcd.setBrightness(0);
-    Serial.println("[Display] Backlight off (sleep)");
+    // 关闭背光（通过缓动系统平滑过渡）
+    _targetBrightness = 0;
+    LOG_I("Sleep target: 0%");
 }
 
 void DisplayManager::wakeup() {
-    // 恢复全亮
-    _lcd.setBrightness(200);
-    Serial.println("[Display] Woke up, full brightness");
+    // 恢复全亮（通过缓动系统平滑过渡）
+    _targetBrightness = LCD_BRIGHTNESS;
+    LOG_I("Wakeup target: 100%");
+}
+
+void DisplayManager::applySmoothBacklight() {
+    // 一阶EMA低通滤波器：平滑过渡背光亮度，消除瞬间闪烁感
+    float target = (float)_targetBrightness;
+    float diff = target - _currentBrightness;
+    
+    // 当差异足够小时直接对齐，避免无限趋近
+    if (fabsf(diff) < 1.0f) {
+        _currentBrightness = target;
+    } else {
+        _currentBrightness += diff * BRIGHTNESS_SMOOTHING;
+    }
+    
+    _lcd.setBrightness((uint8_t)(_currentBrightness + 0.5f));
 }
 
 // ============ 离线模式时钟 ============
@@ -984,10 +1018,11 @@ void DisplayManager::_fadeBlend() {
 
     while (_fadeActive) {
         uint32_t t = millis();
-        uint8_t alpha = (_fadeFrame * 255) / FADE_FRAMES;  // 0..240, 16档
-        uint16_t invAlpha = FADE_FRAMES - _fadeFrame;
+        // 统一使用FADE_FRAMES(16)作为基底，权重和恒为16，>>4安全无溢出
+        uint8_t alpha = _fadeFrame;                       // 0..15
+        uint8_t invAlpha = FADE_FRAMES - _fadeFrame;      // 16..1
 
-        // 逐像素混合: result = old*(1-alpha) + new*alpha (用移位代替除法)
+        // 逐像素混合: result = (old*invAlpha + new*alpha) / FADE_FRAMES
         uint16_t* dst = (uint16_t*)blendBuf;
         const uint16_t* oldPx = (const uint16_t*)oldBuf;
         const uint16_t* newPx = (const uint16_t*)newBuf;
@@ -1087,24 +1122,45 @@ void DisplayManager::applyNightFilter() {
     _nightWarmth = _nightWarmth * 0.95f + targetWarmth * 0.05f;
     if (_nightWarmth < 0.01f) return;  // 暖色极低，跳过处理
 
-    // 逐像素降低蓝通道（直接在_framebuf上操作）
-    // 蓝通道最多减10/31（约32%），保持可读性
-    uint8_t blueReduce = (uint8_t)(_nightWarmth * 10.0f);
-    if (blueReduce == 0) return;
+    // 像素级色温偏移：直接在sprite帧缓冲上逐像素应用色彩矩阵
+    uint16_t* buf = (uint16_t*)_sprite.getBuffer();
+    if (!buf) return;
+    
+    const int totalPixels = SCREEN_WIDTH * SCREEN_HEIGHT;
+    // 预计算偏移量（整数运算，避免浮点内循环）
+    const int redBoost   = (int)(_nightWarmth * 5.0f);    // 红通道+0~5/31
+    const int blueCut    = (int)(_nightWarmth * 12.0f);   // 蓝通道-0~12/31
+    
+    for (int i = 0; i < totalPixels; i++) {
+        uint16_t c = buf[i];
+        // RGB565: RRRRRGGGGGGBBBBB
+        int r = (c >> 11) & 0x1F;
+        int g = (c >> 5)  & 0x3F;
+        int b =  c        & 0x1F;
+        
+        r = r + redBoost;   if (r > 31) r = 31;
+        b = b - blueCut;    if (b < 0)  b = 0;
+        
+        buf[i] = (uint16_t)((r << 11) | (g << 5) | b);
+    }
+}
 
-    // 使用LCD的setAddrWindow+push像素的方式不实际（帧缓冲是sprite）
-    // 改为通过LCD硬件gamma/寄存器调色（ST7789V支持）
-    // 简化实现：调低LCD背光亮度模拟暖色效果
-    int warmBrightness = LCD_BRIGHTNESS - (int)(_nightWarmth * 30.0f);
-    if (warmBrightness < 20) warmBrightness = 20;
-    _lcd.setBrightness(warmBrightness);
+uint16_t DisplayManager::nightShiftColor(uint16_t color) const {
+    if (_nightWarmth < 0.01f) return color;
+    
+    int r = (color >> 11) & 0x1F;
+    int g = (color >> 5)  & 0x3F;
+    int b =  color        & 0x1F;
+    
+    r = r + (int)(_nightWarmth * 5.0f);   if (r > 31) r = 31;
+    b = b - (int)(_nightWarmth * 12.0f);  if (b < 0)  b = 0;
+    
+    return (uint16_t)((r << 11) | (g << 5) | b);
 }
 
 // ============ V-Sync / TE 中断 (硬件Tearing Effect) ============
 // TE引脚由display_manager.h中的TE_PIN定义(config.h配置)
 // ST7789V2在每次frame写入起始时拉低TE引脚，可用作V-Sync信号
-
-volatile bool DisplayManager::s_teTriggered = false;
 
 void IRAM_ATTR DisplayManager::_teIsrHandler() {
     s_teTriggered = true;
@@ -1115,13 +1171,13 @@ void DisplayManager::setupVSync() {
     // ST7789V2 TE引脚默认输出模式，frame scan期间为LOW
     // 注: 需先通过SPI命令0x35启用TE output line
     if (LCD_TE_PIN < 0) {
-        Serial.println("[Display] V-Sync disabled (LCD_TE_PIN < 0)");
+        LOG_I("V-Sync disabled (LCD_TE_PIN < 0)");
         return;
     }
     pinMode(LCD_TE_PIN, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(LCD_TE_PIN), _teIsrHandler, FALLING);
     s_teTriggered = false;
-    Serial.printf("[Display] V-Sync TE interrupt configured on GPIO %d\n", LCD_TE_PIN);
+    LOG_I("V-Sync TE interrupt configured on GPIO %d\n", LCD_TE_PIN);
 }
 
 void DisplayManager::waitForVSync(uint32_t timeout_ms) {

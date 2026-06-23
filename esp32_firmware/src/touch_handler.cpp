@@ -1,4 +1,5 @@
 #include "touch_handler.h"
+#include "log.h"
 
 // ============ ProximitySensor 实现 ============
 
@@ -18,7 +19,7 @@ void ProximitySensor::begin() {
     _fastEMA = _baseline;
     _slowEMA = _baseline;
     _initialized = true;
-    Serial.printf("[Proximity] Baseline calibrated: %u\n", _baseline);
+    LOG_I("Baseline calibrated: %u\n", _baseline);
 }
 
 bool ProximitySensor::update() {
@@ -38,7 +39,7 @@ bool ProximitySensor::update() {
             _lastNearTime = now;
             if (now - _lastEventTime > PROX_COOLDOWN_MS) {
                 _lastEventTime = now;
-                Serial.printf("[Proximity] NEAR detected (diff=%.1f)\n", diff);
+                LOG_I("NEAR detected (diff=%.1f)\n", diff);
                 return true;  // 触发接近事件
             }
         }
@@ -70,8 +71,7 @@ void TouchHandler::begin() {
     calibrate();
     proximity.begin();  // 同时初始化接近感应
     _initialized = true;
-    Serial.printf("[Touch] Initialized on GPIO %d, baseline=%u, threshold=%u\n",
-                  TOUCH_PIN, _baseline, _threshold);
+    LOG_I("Initialized on GPIO %d, baseline=%u, threshold=%u\n", TOUCH_PIN, _baseline, _threshold);
 }
 
 void TouchHandler::calibrate() {
@@ -136,7 +136,7 @@ void TouchHandler::update() {
 
 bool TouchHandler::isProximityWakeActive() const {
     return proximity.isNear() || 
-           (millis() - proximity._lastNearTime < PROX_WAKE_DURATION_MS);
+           (millis() - proximity.getLastNearTime() < PROX_WAKE_DURATION_MS);
 }
 
 void TouchHandler::setCallback(TouchCallback cb) {

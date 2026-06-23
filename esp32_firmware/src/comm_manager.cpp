@@ -1,5 +1,7 @@
 #include "comm_manager.h"
 #include <WiFi.h>
+#include <lwip/sockets.h>  // TCP keepalive setsockopt
+#include "log.h"
 
 CommManager::CommManager() 
     : _connected(false), _hasNewData(false), _lastReconnect(0)
@@ -21,36 +23,38 @@ void CommManager::begin() {
 void CommManager::setServer(String host, int port) {
     _serverHost = host;
     _serverPort = port;
-    Serial.print("[Comm] Server set to: ");
-    Serial.print(host);
-    Serial.print(":");
-    Serial.println(port);
+    LOG_I("Server set to: %s:%d", String(host).c_str(), (int)port);
 }
 
 bool CommManager::connect() {
     if (_serverHost.length() == 0) {
-        Serial.println("[Comm] No server configured!");
+        LOG_I("No server configured!");
         return false;
     }
     
-    Serial.print("[Comm] Connecting to ");
-    Serial.print(_serverHost);
-    Serial.print(":");
-    Serial.println(_serverPort);
+    LOG_I("Connecting to %s:%d", String(_serverHost).c_str(), (int)_serverPort);
     
     // [Step 3] TCP超时配置（必须在connect前设置）
     _client.setTimeout(CLIENT_TCP_TIMEOUT);
     
     if (_client.connect(_serverHost.c_str(), _serverPort)) {
-        Serial.println("[Comm] Connected!");
+        LOG_I("Connected!");
         _connected = true;
         _frameState = FRAME_IDLE;
         
-        // [Step 3] TCP Keep-Alive（空闲检测连接死活）
-        _client.setOption(TCP_KEEPALIVE, true);
-        _client.setOption(TCP_KEEPIDLE,  CLIENT_TCP_KEEPIDLE);
-        _client.setOption(TCP_KEEPINTVL, CLIENT_TCP_KEEPINTVL);
-        _client.setOption(TCP_KEEPCNT,   CLIENT_TCP_KEEPCNT);
+        // [Step 3] TCP Keep-Alive: 检测死连接（路由器NAT超时、服务端崩溃）
+        {
+            int fd = _client.fd();
+            int enable = 1;
+            setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &enable, sizeof(enable));
+            int idle = 60;    // 空闲60秒后开始探测
+            setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+            int intvl = 10;   // 每10秒探测一次
+            setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+            int cnt = 3;      // 连续3次无响应判定断开
+            setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+            LOG_I("TCP keepalive enabled (60s idle / 10s interval / 3 probes)");
+        }
         _reconnectFailCount = 0;           // 重置退避计数
         _reconnectInterval = RECONNECT_INTERVAL;  // 重置退避间隔
         
@@ -67,7 +71,7 @@ bool CommManager::connect() {
         return true;
     }
     
-    Serial.println("[Comm] Connection failed!");
+    LOG_E("Connection failed!");
     _connected = false;
     return false;
 }
@@ -93,7 +97,7 @@ void CommManager::reconnect() {
     
     // 连续失败10次 → WiFi硬重置（解决DHCP/关联状态异常）
     if (_reconnectFailCount >= 10) {
-        Serial.println("[Comm] 10 failures, hard-resetting WiFi...");
+        LOG_E("10 failures, hard-resetting WiFi...");
         WiFi.disconnect(true);
         delay(200);
         WiFi.begin();
@@ -102,8 +106,7 @@ void CommManager::reconnect() {
         return;
     }
     
-    Serial.printf("[Comm] Reconnecting #%d (backoff %lu ms)...\n",
-                  _reconnectFailCount, _reconnectInterval);
+    LOG_I("Reconnecting #%d (backoff %lu ms)...\n", _reconnectFailCount, _reconnectInterval);
     connect();
     
     // 指数退避：每次失败翻倍，上限60秒
@@ -116,7 +119,7 @@ void CommManager::update() {
     // [Step 2] 非阻塞TCP读取：用read()替代readBytes()避免阻塞
     // read()只读取当前available()的数据，不会阻塞等待
     while (_client.connected() && _client.available()) {
-        size_t bytesRead = _client.read(_readBuf, min((int)CLIENT_READ_BUF_SIZE, _client.available()));
+        size_t bytesRead = _client.read((uint8_t*)_readBuf, min((int)CLIENT_READ_BUF_SIZE, _client.available()));
         for (size_t i = 0; i < bytesRead; i++) {
             char c = _readBuf[i];
         
@@ -159,17 +162,20 @@ void CommManager::update() {
                         // 解析 "LEN:NNNN"
                         if (_lenBuffer.startsWith("LEN:")) {
                             _expectedLen = atoi(_lenBuffer.substring(4).c_str());
-                            if (_expectedLen > 0 && _expectedLen < 256 * 1024) {
+                            // [FIX-M4] 帧长度上限从16KB对齐到256KB，与PC端FRAME_MAX_LEN一致
+                            // ESP32-S3有320KB PSRAM，256KB帧完全可承受
+                            // 同时检查<=0防止atoi解析异常导致负数
+                            if (_expectedLen > 0 && _expectedLen <= 256 * 1024) {
                                 _frameBuffer = "";
                                 _frameBuffer.reserve(_expectedLen);
                                 _frameState = FRAME_READ_BODY;
-                                Serial.printf("[Comm] Frame len=%d\n", _expectedLen);
+                                LOG_I("Frame len=%d\n", _expectedLen);
                             } else {
-                                Serial.printf("[Comm] Invalid len: %s\n", _lenBuffer.c_str());
+                                LOG_E("Invalid len: %s (parsed=%d)\n", _lenBuffer.c_str(), _expectedLen);
                                 _frameState = FRAME_IDLE;
                             }
                         } else {
-                            Serial.printf("[Comm] Bad header: %s\n", _lenBuffer.c_str());
+                            LOG_I("Bad header: %s\n", _lenBuffer.c_str());
                             _frameState = FRAME_IDLE;
                         }
                         _lenBuffer = "";
@@ -177,7 +183,7 @@ void CommManager::update() {
                         _lenBuffer += c;
                         // 防止超长header攻击
                         if (_lenBuffer.length() > 16) {
-                            Serial.println("[Comm] Header overflow, reset");
+                            LOG_E("Header overflow, reset");
                             _lenBuffer = "";
                             _frameState = FRAME_IDLE;
                         }
@@ -204,7 +210,7 @@ void CommManager::update() {
                         _frameBuffer += c;
                         // 防止单帧过大（旧格式无长度保护）
                         if (_frameBuffer.length() > 32 * 1024) {
-                            Serial.println("[Comm] Legacy frame overflow, reset");
+                            LOG_E("Legacy frame overflow, reset");
                             _frameBuffer = "";
                             _frameState = FRAME_IDLE;
                         }
@@ -216,7 +222,7 @@ void CommManager::update() {
     
     // 检查连接状态
     if (!_client.connected()) {
-        Serial.println("[Comm] Connection lost!");
+        LOG_E("Connection lost!");
         _connected = false;
         // 断连后启用WiFi省电模式，降低RF功耗
         WiFi.setSleep(true);
@@ -231,9 +237,9 @@ void CommManager::processData(const String& data_) {
     _hasNewData = true;
     _lastReceiveTime = millis();
     
-    Serial.print("[Comm] Received: ");
-    Serial.print(data.substring(0, 50));
-    Serial.println("...");
+    LOG_I("Received: ");
+    LOG_I("%s", String(data.substring(0, 50)).c_str());
+    LOG_I("...");
 }
 
 bool CommManager::isConnected() {
@@ -251,14 +257,15 @@ String CommManager::getData() {
 }
 
 void CommManager::sendFramed(const String& json) {
-    // 帧格式: "LEN:<length>\n<payload>"
-    String header = "LEN:" + String(json.length()) + "\n";
-    _client.print(header);
+    // 帧格式: "LEN:<length>\n<payload>" - snprintf避免String堆分配
+    char header[16];
+    int len = snprintf(header, sizeof(header), "LEN:%d\n", (int)json.length());
+    _client.write((const uint8_t*)header, len);
     _client.print(json);
 }
 
 void CommManager::sendHeartbeat() {
-    StaticJsonDocument<256>;
+    StaticJsonDocument<256> doc;
     doc["type"] = "heartbeat";
     doc["ts"] = millis();
     
@@ -268,7 +275,7 @@ void CommManager::sendHeartbeat() {
 }
 
 void CommManager::sendMessage(String type, JsonObject data) {
-    StaticJsonDocument<768>;
+    StaticJsonDocument<768> doc;
     doc["type"] = type;
     doc["data"] = data;
     doc["ts"] = millis();

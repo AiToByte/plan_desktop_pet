@@ -1,4 +1,5 @@
 #include "web_config.h"
+#include "log.h"
 
 WebConfig::WebConfig() : _server(nullptr), _state(CONFIG_IDLE), _configStartTime(0) {
     _config.valid = false;
@@ -12,12 +13,11 @@ bool WebConfig::begin() {
 
 bool WebConfig::connectFromSaved() {
     if (!_config.valid) {
-        Serial.println("[WebConfig] No saved config found");
+        LOG_I("No saved config found");
         return false;
     }
     
-    Serial.print("[WebConfig] Connecting to saved WiFi: ");
-    Serial.println(_config.wifi_ssid);
+    LOG_I("Connecting to saved WiFi: %s", _config.wifi_ssid.c_str());
     
     WiFi.mode(WIFI_STA);
     WiFi.begin(_config.wifi_ssid.c_str(), _config.wifi_password.c_str());
@@ -25,23 +25,21 @@ bool WebConfig::connectFromSaved() {
     unsigned long start = millis();
     while (WiFi.status() != WL_CONNECTED) {
         if (millis() - start > WIFI_TIMEOUT) {
-            Serial.println("[WebConfig] Saved config connection failed");
+            LOG_E("Saved config connection failed");
             return false;
         }
         delay(500);
-        Serial.print(".");
+        LOG_I(".");
     }
     
-    Serial.println();
-    Serial.print("[WebConfig] Connected! IP: ");
-    Serial.println(WiFi.localIP());
+    LOG_I("Connected! IP: %s", WiFi.localIP().toString().c_str());
     
     _state = CONFIG_CONNECTED;
     return true;
 }
 
 void WebConfig::startAPMode() {
-    Serial.println("[WebConfig] Starting AP mode...");
+    LOG_I("Starting AP mode...");
     
     // 配置AP模式
     WiFi.mode(WIFI_AP_STA);
@@ -49,12 +47,8 @@ void WebConfig::startAPMode() {
     
     delay(500);
     
-    Serial.print("[WebConfig] AP started: ");
-    Serial.print(AP_SSID);
-    Serial.print(" Password: ");
-    Serial.println(AP_PASSWORD);
-    Serial.print("[WebConfig] AP IP: ");
-    Serial.println(WiFi.softAPIP());
+    LOG_I("AP started: %s Password: %s", String(AP_SSID).c_str(), String(AP_PASSWORD).c_str());
+    LOG_I("AP IP: %s", WiFi.softAPIP().toString().c_str());
     
     // 创建Web服务器
     if (_server) {
@@ -77,7 +71,7 @@ void WebConfig::startAPMode() {
     _state = CONFIG_AP_MODE;
     _configStartTime = millis();
     
-    Serial.println("[WebConfig] Web server started on port 80");
+    LOG_I("Web server started on port 80");
 }
 
 void WebConfig::handleClient() {
@@ -86,7 +80,7 @@ void WebConfig::handleClient() {
         
         // 检查超时
         if (millis() - _configStartTime > CONFIG_TIMEOUT) {
-            Serial.println("[WebConfig] Config timeout, restarting...");
+            LOG_W("Config timeout, restarting...");
             ESP.restart();
         }
     }
@@ -110,7 +104,7 @@ StoredConfig WebConfig::getConfig() {
 void WebConfig::resetConfig() {
     _prefs.clear();
     _config.valid = false;
-    Serial.println("[WebConfig] Config reset");
+    LOG_I("Config reset");
 }
 
 String WebConfig::getAPIP() {
@@ -150,7 +144,7 @@ void WebConfig::handleSave() {
     
     _server->send(200, "text/html", getSuccessPageHTML());
     
-    Serial.println("[WebConfig] Config saved, restarting in 3 seconds...");
+    LOG_I("Config saved, restarting in 3 seconds...");
     delay(3000);
     ESP.restart();
 }
@@ -159,7 +153,7 @@ void WebConfig::handleReset() {
     resetConfig();
     _server->send(200, "text/html", getSuccessPageHTML());
     
-    Serial.println("[WebConfig] Config reset, restarting in 3 seconds...");
+    LOG_I("Config reset, restarting in 3 seconds...");
     delay(3000);
     ESP.restart();
 }
@@ -189,14 +183,14 @@ void WebConfig::saveToFlash(String ssid, String pass, String host, int port) {
     _config.server_port = port;
     _config.valid = true;
     
-    Serial.println("[WebConfig] Config saved to Flash");
+    LOG_I("Config saved to Flash");
 }
 
 bool WebConfig::loadFromFlash() {
     _config.valid = _prefs.getBool("valid", false);
     
     if (!_config.valid) {
-        Serial.println("[WebConfig] No valid config in Flash");
+        LOG_I("No valid config in Flash");
         return false;
     }
     
@@ -205,12 +199,9 @@ bool WebConfig::loadFromFlash() {
     _config.server_host = _prefs.getString("host", "");
     _config.server_port = _prefs.getInt("port", SERVER_PORT);
     
-    Serial.print("[WebConfig] Loaded config: ");
-    Serial.print(_config.wifi_ssid);
-    Serial.print(" -> ");
-    Serial.print(_config.server_host);
-    Serial.print(":");
-    Serial.println(_config.server_port);
+    LOG_I("Loaded config: ");
+    LOG_I("%s", String(_config.wifi_ssid).c_str());
+    LOG_I(" -> %s:%d", String(_config.server_host).c_str(), (int)_config.server_port);
     
     return true;
 }
@@ -555,12 +546,12 @@ void WebConfig::handleOTAUpload() {
     HTTPUpload& upload = _server->upload();
 
     if (upload.status == UPLOAD_FILE_START) {
-        Serial.printf("[OTA] Start: %s\n", upload.filename.c_str());
+        LOG_I("Start: %s\n", upload.filename.c_str());
         // 挂起渲染任务，释放Core 1的SPI总线+CPU给OTA
         extern TaskHandle_t g_renderTaskHandle;
         if (g_renderTaskHandle) {
             vTaskSuspend(g_renderTaskHandle);
-            Serial.println("[OTA] RenderTask suspended for firmware update");
+            LOG_I("RenderTask suspended for firmware update");
         }
         // 记录当前运行分区，用于回滚
         _otaPrevPartition = esp_ota_get_running_partition();
@@ -569,7 +560,7 @@ void WebConfig::handleOTAUpload() {
             // Update.begin失败，恢复渲染任务
             if (g_renderTaskHandle) {
                 vTaskResume(g_renderTaskHandle);
-                Serial.println("[OTA] RenderTask resumed (Update.begin failed)");
+                LOG_E("RenderTask resumed (Update.begin failed)");
             }
         }
     }
@@ -583,21 +574,21 @@ void WebConfig::handleOTAUpload() {
         extern TaskHandle_t g_renderTaskHandle;
         if (g_renderTaskHandle) {
             vTaskResume(g_renderTaskHandle);
-            Serial.println("[OTA] RenderTask resumed");
+            LOG_I("RenderTask resumed");
         }
         if (Update.end(true)) {
-            Serial.printf("[OTA] Success: %u bytes\n", upload.totalSize);
+            LOG_I("Success: %u bytes\n", upload.totalSize);
             // 标记OTA应用镜像有效，取消回滚
             esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
             if (err != ESP_OK) {
-                Serial.printf("[OTA] Mark valid failed: %d\n", err);
+                LOG_E("Mark valid failed: %d\n", err);
             }
         } else {
             Update.printError(Serial);
             // 更新失败，设置回滚到之前的分区
             if (_otaPrevPartition) {
                 esp_ota_set_boot_partition(_otaPrevPartition);
-                Serial.println("[OTA] Rollback to previous partition");
+                LOG_I("Rollback to previous partition");
             }
         }
     }
@@ -618,7 +609,7 @@ void WebConfig::handleOTARollback() {
     // OTA回滚：重启到上一个有效的应用分区
     const esp_partition_t* prev = esp_ota_get_last_invalid_partition();
     if (prev) {
-        Serial.println("[OTA] Rolling back to previous partition...");
+        LOG_I("Rolling back to previous partition...");
         esp_ota_set_boot_partition(prev);
         _server->send(200, "text/plain", "回滚成功，设备即将重启...");
         delay(1000);

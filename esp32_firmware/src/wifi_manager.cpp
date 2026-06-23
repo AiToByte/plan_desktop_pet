@@ -1,5 +1,9 @@
 #include "wifi_manager.h"
 #include <ESPmDNS.h>
+#include "log.h"
+#ifdef BLE_PROVISIONING_ENABLED
+#include "ble_provisioner.h"
+#endif
 
 WiFiManager::WiFiManager() : _connected(false), _lastAttempt(0), _configMode(false) {}
 
@@ -15,11 +19,11 @@ bool WiFiManager::tryUDPDiscovery(unsigned long timeoutMs) {
     WiFiUDP udp;
     // 使用与PC端相同的广播端口
     if (!udp.begin(19877)) {
-        Serial.println("[WiFi] UDP Discovery: 监听端口失败");
+        LOG_I("UDP Discovery: 监听端口失败");
         return false;
     }
     
-    Serial.printf("[WiFi] UDP Discovery: 监听端口 19877，超时 %lu ms\n", timeoutMs);
+    LOG_I("UDP Discovery: 监听端口 19877，超时 %lu ms\n", timeoutMs);
     
     unsigned long start = millis();
     char buf[128];
@@ -40,7 +44,7 @@ bool WiFiManager::tryUDPDiscovery(unsigned long timeoutMs) {
                     int port = payload.substring(colonIdx + 1).toInt();
                     
                     if (ip.length() > 0 && port > 0) {
-                        Serial.printf("[WiFi] UDP Discovery: 发现服务器 %s:%d\n", ip.c_str(), port);
+                        LOG_I("UDP Discovery: 发现服务器 %s:%d\n", ip.c_str(), port);
                         
                         // 保存到Flash（与WebConfig统一命名空间和Key）
                         Preferences prefs;
@@ -60,7 +64,7 @@ bool WiFiManager::tryUDPDiscovery(unsigned long timeoutMs) {
     }
     
     udp.stop();
-    Serial.println("[WiFi] UDP Discovery: 超时，未发现服务器");
+    LOG_I("UDP Discovery: 超时，未发现服务器");
     return false;
 }
 
@@ -74,9 +78,9 @@ bool WiFiManager::connect() {
     }
     
     // 保存的配置失败，先尝试mDNS发现PC服务器（最快）
-    Serial.println("[WiFi] Saved config failed, trying mDNS discovery...");
+    LOG_E("Saved config failed, trying mDNS discovery...");
     if (_tryMDNSDiscovery()) {
-        Serial.println("[WiFi] mDNS discovery OK, retrying connection...");
+        LOG_W("mDNS discovery OK, retrying connection...");
         if (_webConfig.connectFromSaved()) {
             _connected = true;
             _configMode = false;
@@ -86,9 +90,9 @@ bool WiFiManager::connect() {
     }
     
     // mDNS失败，尝试UDP自动发现PC服务器
-    Serial.println("[WiFi] mDNS failed, trying UDP discovery...");
+    LOG_E("mDNS failed, trying UDP discovery...");
     if (tryUDPDiscovery()) {
-        Serial.println("[WiFi] UDP discovery OK, retrying connection...");
+        LOG_W("UDP discovery OK, retrying connection...");
         if (_webConfig.connectFromSaved()) {
             _connected = true;
             _configMode = false;
@@ -97,8 +101,25 @@ bool WiFiManager::connect() {
         }
     }
     
-    // 自动发现也失败，进入配网模式
-    Serial.println("[WiFi] UDP discovery failed, starting config mode...");
+    // 自动发现也失败，尝试BLE配网（120s超时），超时后降级AP
+#ifdef BLE_PROVISIONING_ENABLED
+    LOG_W("Trying BLE provisioning (120s timeout)...");
+    BLEProvisioner ble;
+    if (ble.startProvisioning(120000)) {
+        // BLE配网成功，重新尝试WiFi连接
+        LOG_W("BLE provisioned, retrying WiFi...");
+        if (_webConfig.connectFromSaved()) {
+            _connected = true;
+            _configMode = false;
+            _startMDNS();
+            return true;
+        }
+        LOG_E("BLE provisioned but WiFi still failed");
+    }
+    // BLE超时或WiFi仍失败，降级到AP配网模式
+    LOG_E("BLE timeout/failed, falling back to AP mode...");
+#endif
+    
     startConfigMode();
     return false;
 }
@@ -107,15 +128,12 @@ void WiFiManager::startConfigMode() {
     _configMode = true;
     _webConfig.startAPMode();
     
-    Serial.println("=========================================");
-    Serial.println("[WiFi] Web配网模式已启动");
-    Serial.print("[WiFi] 请连接热点: ");
-    Serial.println(AP_SSID);
-    Serial.print("[WiFi] 密码: ");
-    Serial.println(AP_PASSWORD);
-    Serial.print("[WiFi] 然后访问: http://");
-    Serial.println(_webConfig.getAPIP());
-    Serial.println("=========================================");
+    LOG_I("=========================================");
+    LOG_I("Web配网模式已启动");
+    LOG_I("请连接热点: %s", String(AP_SSID).c_str());
+    LOG_I("密码: %s", String(AP_PASSWORD).c_str());
+    LOG_I("然后访问: http://%s", _webConfig.getAPIP().c_str());
+    LOG_I("=========================================");
 }
 
 void WiFiManager::handleConfig() {
@@ -163,11 +181,11 @@ void WiFiManager::disconnect() {
 }
 
 bool WiFiManager::_tryMDNSDiscovery() {
-    Serial.println("[WiFi] mDNS: querying _deskpet._tcp.local. ...");
+    LOG_I("mDNS: querying _deskpet._tcp.local. ...");
     
     int n = MDNS.queryService("deskpet", "tcp");
     if (n == 0) {
-        Serial.println("[WiFi] mDNS: no service found");
+        LOG_I("mDNS: no service found");
         return false;
     }
     
@@ -176,11 +194,11 @@ bool WiFiManager::_tryMDNSDiscovery() {
     int port = MDNS.port(0);
     
     if (ip.length() == 0 || port <= 0) {
-        Serial.println("[WiFi] mDNS: invalid result");
+        LOG_E("mDNS: invalid result");
         return false;
     }
     
-    Serial.printf("[WiFi] mDNS: found %s:%d\n", ip.c_str(), port);
+    LOG_I("mDNS: found %s:%d\n", ip.c_str(), port);
     
     // 保存到Flash（与WebConfig统一命名空间和Key）
     Preferences prefs;
@@ -196,8 +214,8 @@ bool WiFiManager::_tryMDNSDiscovery() {
 void WiFiManager::_startMDNS() {
     if (MDNS.begin("deskpet")) {
         MDNS.addService("deskpet", "tcp", _webConfig.getConfig().server_port);
-        Serial.println("[WiFi] mDNS started: deskpet.local");
+        LOG_I("mDNS started: deskpet.local");
     } else {
-        Serial.println("[WiFi] mDNS start failed");
+        LOG_E("mDNS start failed");
     }
 }

@@ -7,6 +7,7 @@
 
 #include "ble_config.h"
 #include <WiFi.h>
+#include "log.h"
 
 // BLE UUID定义
 #define CONFIG_SERVICE_UUID      "1820"  // 自定义配网服务
@@ -23,12 +24,12 @@ public:
     BleConfigServerCallbacks(BleConfigManager& mgr) : _mgr(mgr) {}
     
     void onConnect(NimBLEServer* pServer) override {
-        Serial.println("[BLE] Client connected");
+        LOG_I("Client connected");
         _mgr.setState(BLE_CONFIG_CONNECTED);
     }
     
     void onDisconnect(NimBLEServer* pServer) override {
-        Serial.println("[BLE] Client disconnected");
+        LOG_I("Client disconnected");
         if (_mgr.isConfiguring()) {
             _mgr.startAdvertising(_mgr._advTimeout);
         }
@@ -42,7 +43,7 @@ public:
     
     void onWrite(NimBLECharacteristic* pChar) override {
         _mgr._credentials.ssid = pChar->getValue().c_str();
-        Serial.printf("[BLE] SSID received: %s\n", _mgr._credentials.ssid.c_str());
+        LOG_I("SSID received: %s\n", _mgr._credentials.ssid.c_str());
     }
 };
 
@@ -53,13 +54,13 @@ public:
     
     void onWrite(NimBLECharacteristic* pChar) override {
         _mgr._credentials.password = pChar->getValue().c_str();
-        Serial.printf("[BLE] Password received (%d chars)\n", _mgr._credentials.password.length());
+        LOG_I("Password received (%d chars)\n", _mgr._credentials.password.length());
         
         // 收到密码后标记凭据就绪
         if (_mgr._credentials.ssid.length() > 0) {
             _mgr._hasNewCredentials = true;
             _mgr.setState(BLE_CONFIG_CREDENTIALS);
-            Serial.println("[BLE] Credentials complete!");
+            LOG_I("Credentials complete!");
         }
     }
 };
@@ -71,7 +72,7 @@ public:
     
     void onWrite(NimBLECharacteristic* pChar) override {
         _mgr._credentials.resourceUrl = pChar->getValue().c_str();
-        Serial.printf("[BLE] Resource URL: %s\n", _mgr._credentials.resourceUrl.c_str());
+        LOG_I("Resource URL: %s\n", _mgr._credentials.resourceUrl.c_str());
     }
 };
 
@@ -86,7 +87,7 @@ BleConfigManager::BleConfigManager()
 bool BleConfigManager::begin(const String& deviceName) {
     if (_initialized) return true;
     
-    Serial.printf("[BLE] Initializing: %s\n", deviceName.c_str());
+    LOG_I("Initializing: %s\n", deviceName.c_str());
     
     NimBLEDevice::init(deviceName.c_str());
     NimBLEDevice::setPower(ESP_PWR_LVL_P6);  // 增强发射功率
@@ -137,7 +138,7 @@ bool BleConfigManager::begin(const String& deviceName) {
     adv->setMinPreferred(0x12);
     
     _initialized = true;
-    Serial.println("[BLE] Init OK");
+    LOG_I("Init OK");
     return true;
 }
 
@@ -149,7 +150,7 @@ bool BleConfigManager::startAdvertising(uint16_t timeoutSec) {
     _state = BLE_CONFIG_ADVERTISING;
     
     NimBLEDevice::startAdvertising();
-    Serial.printf("[BLE] Advertising started (timeout=%ds)\n", timeoutSec);
+    LOG_W("Advertising started (timeout=%ds)\n", timeoutSec);
     
     _notifyStatus(BLE_CONFIG_ADVERTISING);
     return true;
@@ -161,7 +162,7 @@ void BleConfigManager::stop() {
     NimBLEDevice::stopAdvertising();
     _state = BLE_CONFIG_IDLE;
     _notifyStatus(BLE_CONFIG_IDLE);
-    Serial.println("[BLE] Advertising stopped");
+    LOG_I("Advertising stopped");
 }
 
 void BleConfigManager::update() {
@@ -171,7 +172,7 @@ void BleConfigManager::update() {
     if (_advTimeout > 0) {
         unsigned long elapsed = (millis() - _advStartTime) / 1000;
         if (elapsed >= _advTimeout) {
-            Serial.println("[BLE] Advertising timeout");
+            LOG_W("Advertising timeout");
             stop();
         }
     }

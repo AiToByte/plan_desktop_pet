@@ -23,6 +23,7 @@
 #include "driver/rtc_io.h"
 #include "ambient_light.h"
 #include "haptic_driver.h"
+#include "log.h"
 
 // ============ 共享数据 (双缓冲+atomic指针交换，无mutex阻塞) ============
 DisplayData g_displayBuf[2];           // 双缓冲：front=read, back=write
@@ -52,8 +53,11 @@ HapticDriver hapticDriver;
 TaskHandle_t g_commTaskHandle = NULL;
 TaskHandle_t g_renderTaskHandle = NULL;
 
+// 崩溃计数（RTC_NOINIT_ATTR：重启不丢失）
+RTC_NOINIT_ATTR uint32_t s_crashCount = 0;
+
 // 休眠状态
-unsigned long g_lastDataReceived = 0;  // 最后收到有效数据的时间
+std::atomic<unsigned long> g_lastDataReceived{0};  // 最后收到有效数据的时间(原子,跨核安全)
 unsigned long g_screenSleepStart = 0;  // 进入屏幕休眠的时间（用于Light Sleep计时）
 bool g_screenDimmed = false;
 bool g_screenSleeping = false;
@@ -69,7 +73,7 @@ std::atomic<PixelPlayer*> g_pendingPixelPtr{nullptr};
 std::atomic<size_t> g_pendingPixelSize{0};
 
 // OTA升级时挂起渲染任务，释放Core 1的SPI总线+CPU
-TaskHandle_t g_renderTaskHandle = NULL;
+// (g_renderTaskHandle已在上方line 53定义)
 
 // ============ 前向声明 ============
 void parseServerData(String json);
@@ -79,7 +83,7 @@ void renderTask(void* pvParameters);
 
 // ============ 通信任务 (Core 0) ============
 void commTask(void* pvParameters) {
-    Serial.println("[CommTask] Started on Core 0");
+    LOG_I("Started on Core 0");
     unsigned long lastHeartbeat = 0;
     bool isOffline = false;
     
@@ -102,12 +106,14 @@ void commTask(void* pvParameters) {
             parseServerData(json);
             
             // [Step 5] 双缓冲写入：更新连接状态
+            // [FIX-N1] 只load一次frontIdx，防止两次load之间被Core 1 swap
             {
-                int backIdx = 1 - g_frontIdx.load(std::memory_order_acquire);
-                g_displayBuf[backIdx] = g_displayBuf[g_frontIdx.load(std::memory_order_acquire)];
+                int front = g_frontIdx.load(std::memory_order_acquire);
+                int backIdx = 1 - front;
+                g_displayBuf[backIdx] = g_displayBuf[front];
                 g_displayBuf[backIdx].connected = true;
                 g_displayBuf[backIdx].lastUpdate = now;
-                g_lastDataReceived = now;
+                g_lastDataReceived.store(now, std::memory_order_release);
                 isOffline = false;
                 g_forceWake.store(true, std::memory_order_release);  // 通知渲染任务唤醒屏幕
                 g_frontIdx.store(backIdx, std::memory_order_release);
@@ -115,17 +121,19 @@ void commTask(void* pvParameters) {
         }
 
         // 离线检测：45秒无数据 → OFFLINE
-        if (!isOffline && (now - g_lastDataReceived > OFFLINE_TIMEOUT_MS)) {
+        if (!isOffline && (now - g_lastDataReceived.load(std::memory_order_acquire) > OFFLINE_TIMEOUT_MS)) {
             // [Step 5] 双缓冲：标记离线
+            // [FIX-N1] 只load一次frontIdx，防止两次load之间被Core 1 swap
             {
-                int backIdx = 1 - g_frontIdx.load(std::memory_order_acquire);
-                g_displayBuf[backIdx] = g_displayBuf[g_frontIdx.load(std::memory_order_acquire)];
+                int front = g_frontIdx.load(std::memory_order_acquire);
+                int backIdx = 1 - front;
+                g_displayBuf[backIdx] = g_displayBuf[front];
                 g_displayBuf[backIdx].connected = false;
                 g_displayBuf[backIdx].agent.status = STATUS_OFFLINE;
                 isOffline = true;
                 g_frontIdx.store(backIdx, std::memory_order_release);
             }
-            Serial.println("[CommTask] 45s无数据，进入OFFLINE模式");
+            LOG_I("45s无数据，进入OFFLINE模式");
         }
 
         // BOOT键(GPIO0)：短按停止像素播放，切回普通模式；休眠中按下则唤醒屏幕
@@ -135,13 +143,13 @@ void commTask(void* pvParameters) {
                 // 休眠状态下：唤醒屏幕显示15秒
                 if (g_screenSleeping) {
                     g_forceWake.store(true, std::memory_order_release);
-                    Serial.println("[CommTask] BOOT键：唤醒屏幕(15s)");
+                    LOG_I("BOOT键：唤醒屏幕(15s)");
                 }
                 // 普通状态下：停止像素播放
                 else if (pixelPlayer.isLoaded()) {
                     pixelPlayer.stop();
                     g_pendingNormalMode.store(true);
-                    Serial.println("[CommTask] BOOT键：停止像素播放");
+                    LOG_I("BOOT键：停止像素播放");
                 }
                 while (digitalRead(0) == LOW) vTaskDelay(pdMS_TO_TICKS(10));  // 等释放
             }
@@ -157,7 +165,7 @@ void commTask(void* pvParameters) {
             g_pxlOffset = 0;
             g_pendingNormalMode = true;  // Core 1将执行display.setNormalMode()
             comm.reconnect();
-            Serial.println("[CommTask] 连接断开(边沿触发)，已发起重连");
+            LOG_I("连接断开(边沿触发)，已发起重连");
         }
         wasConnected = nowConnected;
         
@@ -181,62 +189,17 @@ void commTask(void* pvParameters) {
             String crashJson;
             serializeJson(crashMsg, crashJson);
             comm.sendFramed(crashJson);
-            Serial.printf("[CRASH] Telemetry sent: count=%u, reason=%d\n", s_crashCount, (int)esp_reset_reason());
+            LOG_E("Telemetry sent: count=%u, reason=%d\n", s_crashCount, (int)esp_reset_reason());
             crashReported = true;
         }
         
         vTaskDelay(pdMS_TO_TICKS(10));  // 让出CPU，避免看门狗超时
     }
-
-    else if (type == "ping") {
-        // 应用层Ping/Pong心跳回应
-        StaticJsonDocument<128> pong;
-        pong["type"] = "pong";
-        pong["ts"] = millis();
-        pong["ping_ts"] = doc["ts"] | 0;
-        String pongJson;
-        serializeJson(pong, pongJson);
-        comm.sendFramed(pongJson);
-        Serial.println("[Comm] Pong sent");
-    }
-        else if (type == "thinking_status") {
-        // 思考链状态 (from OTLP ThinkingChainTracker)
-        StaticJsonDocument<256> filter;
-        filter["type"] = true;
-        filter["data"]["state"] = true;
-        filter["data"]["name"] = true;
-        filter["data"]["tool"] = true;
-        filter["data"]["step_count"] = true;
-        
-        StaticJsonDocument<256> doc;
-        DeserializationError error = deserializeJson(doc, json, DeserializationOption::Filter(filter));
-        if (error) { Serial.printf("[JSON] thinking parse error: %s\n", error.c_str()); return; }
-        
-        JsonObject data = doc["data"];
-        String state = data["state"] | "idle";
-        
-        ThinkingState ts = THINK_IDLE;
-        if (state == "thinking") ts = THINK_THINKING;
-        else if (state == "tool_call") ts = THINK_TOOL_CALL;
-        else if (state == "responding") ts = THINK_RESPONDING;
-        else if (state == "error") ts = THINK_ERROR;
-        else if (state == "done") ts = THINK_DONE;
-        
-        {
-            int backIdx = 1 - g_frontIdx.load(std::memory_order_acquire);
-            g_displayBuf[backIdx] = g_displayBuf[g_frontIdx.load(std::memory_order_acquire)];
-            g_displayBuf[backIdx].thinkingState = ts;
-            g_frontIdx.store(backIdx, std::memory_order_release);
-        }
-        
-        Serial.printf("[Thinking] state=%s tool=%s step=%d\n",
-            state.c_str(), (data["tool"] | "").as<const char*>(), data["step_count"] | 0);
-    }
 }
 
 // ============ 渲染任务 (Core 1) ============
 void renderTask(void* pvParameters) {
-    Serial.println("[RenderTask] Started on Core 1");
+    LOG_I("Started on Core 1");
     g_renderTaskHandle = xTaskGetCurrentTaskHandle();  // 供OTA等场景挂起用
     unsigned long lastDisplayUpdate = 0;
     unsigned long lastAnimationUpdate = 0;
@@ -253,7 +216,7 @@ void renderTask(void* pvParameters) {
         needWake = g_forceWake.exchange(false, std::memory_order_acq_rel);
         
         // ===== 屏幕休眠管理 =====
-        unsigned long timeSinceData = now - g_lastDataReceived;
+        unsigned long timeSinceData = now - g_lastDataReceived.load(std::memory_order_acquire);
         
         if (needWake && (g_screenDimmed || g_screenSleeping)) {
             // 数据到达 → 唤醒屏幕 + 恢复全速CPU + WiFi活跃
@@ -262,7 +225,7 @@ void renderTask(void* pvParameters) {
             display.wakeup();
             g_screenDimmed = false;
             g_screenSleeping = false;
-            Serial.println("[Render] Screen wake (data received), CPU 240MHz, WiFi active");
+            LOG_I("Screen wake (data received), CPU 240MHz, WiFi active");
         } else if (!g_screenSleeping && timeSinceData > SCREEN_SLEEP_TIMEOUT) {
             // 超时 → 进入休眠 + 降频CPU + WiFi节能
             setCpuFrequencyMhz(80);
@@ -271,24 +234,24 @@ void renderTask(void* pvParameters) {
             g_screenSleeping = true;
             g_screenDimmed = true;
             g_screenSleepStart = now;
-            Serial.println("[Render] Screen sleep (timeout), CPU 80MHz, WiFi sleep");
+            LOG_W("Screen sleep (timeout), CPU 80MHz, WiFi sleep");
             vTaskDelay(pdMS_TO_TICKS(1000));  // 休眠后降低刷新率
             continue;
         } else if (!g_screenDimmed && timeSinceData > SCREEN_DIM_TIMEOUT) {
             // 变暗
             display.dim();
             g_screenDimmed = true;
-            Serial.println("[Render] Screen dim (timeout)");
+            LOG_W("Screen dim (timeout)");
         }
         
         if (g_screenSleeping) {
             // Light Sleep: 屏幕休眠5分钟后进入ESP32 Light Sleep（超低功耗）
             static constexpr uint32_t LIGHT_SLEEP_TIMEOUT = 300000;  // 5min
             if (now - g_screenSleepStart >= LIGHT_SLEEP_TIMEOUT) {
-                Serial.println("[Power] Entering Light Sleep (touch+wifi beacon wakeup)");
+                LOG_I("Entering Light Sleep (touch+wifi beacon wakeup)");
                 display.sleep();
                 esp_sleep_enable_touchpad_wakeup();
-                esp_sleep_enable_wifi_beacon_wakeup();
+                // esp_sleep_enable_wifi_beacon_wakeup();  // ESP-IDF版本不支持此API
                 // RTC IO状态保持：锁定关键引脚电平，防止Light Sleep期间漂移
                 gpio_hold_en((gpio_num_t)LCD_BL);       // 背光保持低电平
                 gpio_hold_en((gpio_num_t)BUZZER_PIN);   // 蜂鸣器保持低电平（静音）
@@ -302,29 +265,31 @@ void renderTask(void* pvParameters) {
                 g_screenSleeping = false;
                 g_screenDimmed = false;
                 g_forceWake.store(true, std::memory_order_release);
-                Serial.println("[Power] Woke from Light Sleep, CPU 240MHz");
+                LOG_I("Woke from Light Sleep, CPU 240MHz");
             }
             vTaskDelay(pdMS_TO_TICKS(500));  // 未达Light Sleep阈值时低频轮询
             continue;
         }
         
         // ===== 处理来自Core 0的待执行显示操作 =====
+        // [FIX-N5] 调整顺序：先停像素，再切模式，再播新像素
+        // 原顺序: normalMode → pixelPlay → pixelStop 导致 stop 时 normalMode 已执行但像素仍在播放
+        if (g_pendingPixelStop) {
+            pixelPlayer.stop();
+            g_pendingPixelStop = false;
+            LOG_I("Pixel stop executed (pending)");
+        }
         if (g_pendingNormalMode) {
             display.setNormalMode();
             g_pendingNormalMode = false;
-            Serial.println("[Render] setNormalMode executed (pending)");
+            LOG_I("setNormalMode executed (pending)");
         }
         if (g_pendingPixelPlay && g_pendingPixelPtr) {
             display.setPixelMode(g_pendingPixelPtr.load());
             g_pendingPixelPtr.load()->play();
             g_pendingPixelPlay = false;
             g_pendingPixelPtr = nullptr;
-            Serial.println("[Render] Pixel play executed (pending)");
-        }
-        if (g_pendingPixelStop) {
-            pixelPlayer.stop();
-            g_pendingPixelStop = false;
-            Serial.println("[Render] Pixel stop executed (pending)");
+            LOG_I("Pixel play executed (pending)");
         }
         if (g_pendingPixelBufferLoad && g_pendingPixelBufferPtr) {
             // Core 0 传来的像素缓冲区，在 Core 1 自己的时间片内加载
@@ -334,16 +299,16 @@ void renderTask(void* pvParameters) {
             if (pixelPlayer.loadFromBuffer(buf, sz)) {
                 g_pendingPixelPlay = true;
                 g_pendingPixelPtr = &pixelPlayer;
-                Serial.printf("[Render] Pixel loaded on Core 1: %d bytes, pending play\n", sz);
+                LOG_I("Pixel loaded on Core 1: %d bytes, pending play\n", sz);
             } else {
-                Serial.println("[Render] Pixel load failed on Core 1");
+                LOG_E("Pixel load failed on Core 1");
             }
             // 静态PSRAM池无需free（Core 1加载后数据已复制到PixelPlayer内部）
             g_pendingPixelBufferLoad = false;
         }
         
         // ===== VSync垂直同步：等待TE信号，避免撕裂 =====
-        display.waitForVSync(20);  // 最多等20ms，无TE引脚时自动退化为非阻塞
+        // display.waitForVSync();  // 已在下面统一调用
         
         // ===== 显示更新 =====
         display.waitForVSync();  // 等待TE信号/软件帧间隔，防止撕裂
@@ -369,6 +334,9 @@ void renderTask(void* pvParameters) {
             }
         }
         
+        // 一阶缓动背光：每帧平滑过渡亮度，消除瞬间闪烁
+        display.applySmoothBacklight();
+        
         // ===== 温控自适应（每10秒检测，避免CPU过热） =====
         static unsigned long lastThermalCheck = 0;
         if (!g_screenSleeping && now - lastThermalCheck >= 10000) {
@@ -376,24 +344,32 @@ void renderTask(void* pvParameters) {
             float cpuTemp = temperatureRead();
             if (cpuTemp > 65.0f) {
                 setCpuFrequencyMhz(80);
-                display.setBrightness(80);  // 降低背光减轻发热
-                Serial.printf("[Render] THERMAL CRITICAL %.1f°C → CPU 80MHz + dim\n", cpuTemp);
+                // display.setBrightness(80);  // DisplayManager无此方法，通过LGFX直接控制
+                display.wakeup();  // 使用默认亮度
+                LOG_I("THERMAL CRITICAL %.1f°C → CPU 80MHz + dim\n", cpuTemp);
             } else if (cpuTemp > 55.0f) {
                 setCpuFrequencyMhz(160);
-                Serial.printf("[Render] THERMAL WARNING %.1f°C → CPU 160MHz\n", cpuTemp);
+                LOG_W("THERMAL WARNING %.1f°C → CPU 160MHz\n", cpuTemp);
             } else if (cpuTemp < 50.0f && getCpuFrequencyMhz() < 240) {
                 setCpuFrequencyMhz(240);
-                Serial.printf("[Render] THERMAL OK %.1f°C → CPU 240MHz\n", cpuTemp);
+                LOG_I("THERMAL OK %.1f°C → CPU 240MHz\n", cpuTemp);
             }
         }
         
-        // ===== [Step 7] 堆监控（每5秒打印PSRAM+Internal堆水位） =====
+        // ===== [Step 7] 堆+栈监控（每5秒打印PSRAM+Internal堆水位+栈高水位） =====
         static unsigned long lastHeapLog = 0;
         if (!g_screenSleeping && now - lastHeapLog >= 5000) {
             lastHeapLog = now;
+            // 堆水位
             log_i("[Heap] Internal Free=%d B, MaxAlloc=%d B | PSRAM Free=%d B, MaxAlloc=%d B",
                   ESP.getFreeHeap(), ESP.getMaxAllocHeap(),
                   ESP.getFreePsram(), ESP.getMaxAllocPsram());
+            // 栈高水位（剩余字节，越小越危险）
+            UBaseType_t renderStack = uxTaskGetStackHighWaterMark(NULL);
+            log_i("[Stack] renderTask remaining=%lu B (min safe: 512)", (unsigned long)renderStack * sizeof(StackType_t));
+            if (renderStack * sizeof(StackType_t) < 512) {
+                LOG_E("⚠️ WARNING: renderTask stack near overflow!");
+            }
         }
         
         // ===== [Step 8] FPS计数器（每秒输出实际渲染帧率） =====
@@ -414,7 +390,7 @@ void renderTask(void* pvParameters) {
             frameDelay = 500;       // SLEEP: 2fps
         } else if (g_screenDimmed) {
             frameDelay = 1000;      // DIM: 1fps
-        } else if (millis() - g_lastDataReceived > SCREEN_DIM_TIMEOUT / 2) {
+        } else if (millis() - g_lastDataReceived.load(std::memory_order_acquire) > SCREEN_DIM_TIMEOUT / 2) {
             frameDelay = 200;       // IDLE: 5fps (数据静默>15秒)
         } else {
             // OTLP联动：根据Agent状态微调帧率
@@ -432,11 +408,11 @@ void renderTask(void* pvParameters) {
         touch.update();
         
         // [Phase 4] 光照传感器：定期读取 + 自动背光调节
+        // [FIX-N2] 去掉第一次多余的readLux()调用，仅保留一次有效读取
         static unsigned long lastLightRead = 0;
         if (ambientLight.isAvailable() && !g_screenSleeping && 
             (now - lastLightRead >= BH1750_READ_INTERVAL)) {
-            ambientLight.readLux();
-            uint16_t lux = ambientLight.getLux();
+            int16_t lux = ambientLight.readLux();
             uint8_t pwm = ambientLight.autoAdjustBacklight(lux);
             display.setBrightness(pwm);
             lastLightRead = now;
@@ -450,13 +426,13 @@ void renderTask(void* pvParameters) {
         if (touch.proximity.isNear() || touch.isProximityWakeActive()) {
             if (g_screenSleeping || g_screenDimmed) {
                 g_forceWake = true;
-                display.setBrightness(LCD_BRIGHTNESS);
+                display.wakeup();  // 唤醒屏幕（内部使用LCD_BRIGHTNESS）
                 g_screenSleeping = false;
                 g_screenDimmed = false;
                 g_screenSleepStart = 0;
-                Serial.println("[Proximity] Screen wake triggered");
+                LOG_I("Screen wake triggered");
             }
-            g_lastDataReceived = now;  // 重置休眠计时
+            g_lastDataReceived.store(now, std::memory_order_release);  // 重置休眠计时
         }
         
         vTaskDelay(pdMS_TO_TICKS(frameDelay));
@@ -470,33 +446,32 @@ void setup() {
     
     // [Phase 2] 崩溃遥测：检查reset reason
     esp_reset_reason_t resetReason = esp_reset_reason();
-    Serial.printf("[INIT] Reset reason: %d\n", resetReason);
-    static RTC_NOINIT_ATTR uint32_t s_crashCount;
+    LOG_I("Reset reason: %d\n", resetReason);
     if (resetReason == ESP_RST_PANIC || resetReason == ESP_RST_TASK_WDT || 
         resetReason == ESP_RST_INT_WDT) {
         s_crashCount++;
-        Serial.printf("[CRASH] Panic detected! Count: %u\n", s_crashCount);
+        LOG_E("Panic detected! Count: %u\n", s_crashCount);
         // 注册shutdown handler标记崩溃签名
         esp_register_shutdown_handler([]() {
-            Serial.println("[CRASH] Shutdown handler: preparing telemetry...");
+            LOG_E("Shutdown handler: preparing telemetry...");
         });
     }
     
-    Serial.println("================================");
-    Serial.println("桌面电子宠物 - ESP32-S3 (v2 Dual-Core)");
-    Serial.println("================================");
+    LOG_I("================================");
+    LOG_I("桌面电子宠物 - ESP32-S3 (v2 Dual-Core)");
+    LOG_I("================================");
     
     // [Step 5] 双缓冲模式，无需互斥锁
-    Serial.println("[INIT] Double-buffer mode (no mutex needed)");
+    LOG_I("Double-buffer mode (no mutex needed)");
     
     // 初始化显示
-    Serial.println("[INIT] 初始化显示...");
+    LOG_I("初始化显示...");
     display.begin();
     // PixelPlayer 构造函数已自动初始化，无需 begin()
     display.showBootScreen("Initializing...");
     
     // 初始化蜂鸣器
-    Serial.println("[INIT] 初始化蜂鸣器...");
+    LOG_I("初始化蜂鸣器...");
     sound.begin();
     // 触摸反馈：任何触摸事件触发短促蜂鸣
     touch.setCallback([](TouchEvent event) {
@@ -505,73 +480,73 @@ void setup() {
     sound.playStartup();
     
     // 初始化触摸
-    Serial.println("[INIT] 初始化触摸...");
+    LOG_I("初始化触摸...");
     touch.begin();
     touch.proximity.begin();  // [Phase 1] 接近感应初始化（校准基线）
     touch.setCallback([](TouchEvent e) {
         if (e == TOUCH_SINGLE_TAP) {
             sound.playNotification();
             hapticDriver.click();  // 触觉反馈：轻击
-            Serial.println("[Touch] Single tap");
+            LOG_I("Single tap");
         } else if (e == TOUCH_DOUBLE_TAP) {
             sound.playNotification();
             hapticDriver.buzz();  // 触觉反馈：双击嗡嗡
-            Serial.println("[Touch] Double tap");
+            LOG_I("Double tap");
         } else if (e == TOUCH_LONG_PRESS) {
             sound.playAlert();
             hapticDriver.strongHit();  // 触觉反馈：长按强击
-            Serial.println("[Touch] Long press");
+            LOG_I("Long press");
         } else if (e == TOUCH_PROXIMITY) {
-            Serial.println("[Touch] Proximity detected");
+            LOG_I("Proximity detected");
         }
     });
     
     // 初始化光照传感器
-    Serial.println("[INIT] 初始化BH1750光照传感器...");
+    LOG_I("初始化BH1750光照传感器...");
     ambientLight.begin(BH1750_SDA_PIN, BH1750_SCL_PIN);
     if (ambientLight.isAvailable()) {
-        Serial.println("[INIT] BH1750 ready");
+        LOG_I("BH1750 ready");
     } else {
-        Serial.println("[INIT] BH1750 not found, skipping");
+        LOG_I("BH1750 not found, skipping");
     }
     
     // 初始化触觉反馈
-    Serial.println("[INIT] 初始化DRV2605L触觉反馈...");
+    LOG_I("初始化DRV2605L触觉反馈...");
     hapticDriver.begin(HAPTIC_SDA_PIN, HAPTIC_SCL_PIN);
     if (hapticDriver.isAvailable()) {
         hapticDriver.click();  // 初始化完成提示
-        Serial.println("[INIT] DRV2605L ready");
+        LOG_I("DRV2605L ready");
     } else {
-        Serial.println("[INIT] DRV2605L not found, skipping");
+        LOG_I("DRV2605L not found, skipping");
     }
     
     // 初始化WiFi
-    Serial.println("[INIT] 连接WiFi...");
+    LOG_I("连接WiFi...");
     display.showBootScreen("Connecting WiFi...");
     wifi.begin();
     
     if (wifi.connect()) {
-        Serial.println("[WiFi] Connected: " + wifi.getIP());
+        LOG_I("Connected: %s", (wifi.getIP()).c_str());
         display.showBootScreen("WiFi: " + wifi.getIP());
         
         // 同步NTP时间（东八区）
         configTime(8 * 3600, 0, "ntp.aliyun.com", "ntp1.aliyun.com");
-        Serial.println("[INIT] NTP sync started");
+        LOG_I("NTP sync started");
         
         // 设置通信服务器地址
         String serverHost = wifi.getServerHost();
         int serverPort = wifi.getServerPort();
         if (serverHost.length() > 0) {
             comm.setServer(serverHost, serverPort);
-            Serial.println("[INIT] Server: " + serverHost + ":" + String(serverPort));
+            LOG_I("Server: %s", (serverHost + ":" + String(serverPort)).c_str());
         }
     } else {
-        Serial.println("[WiFi] Connection failed!");
+        LOG_E("Connection failed!");
         display.showBootScreen("WiFi Failed!");
     }
     
     // 初始化通信
-    Serial.println("[INIT] 初始化通信...");
+    LOG_I("初始化通信...");
     comm.begin();
     
     // 初始化数据（双缓冲：初始化front buffer）
@@ -579,10 +554,10 @@ void setup() {
     g_displayBuf[idx].agent.status = STATUS_OFFLINE;
     g_displayBuf[idx].connected = false;
     g_displayBuf[idx].lastUpdate = 0;
-    g_lastDataReceived = millis();
+    g_lastDataReceived.store(millis(), std::memory_order_release);
     
     delay(1000);
-    Serial.println("[INIT] 启动FreeRTOS双核任务...");
+    LOG_I("启动FreeRTOS双核任务...");
     
     // 创建通信任务 (Core 0)
     xTaskCreatePinnedToCore(
@@ -606,8 +581,8 @@ void setup() {
         RENDER_TASK_CORE    // 绑定Core 1
     );
     
-    Serial.println("[INIT] 双核任务启动完成!");
-    Serial.printf("[INIT] CommTask@Core%d, RenderTask@Core%d\n", COMM_TASK_CORE, RENDER_TASK_CORE);
+    LOG_I("双核任务启动完成!");
+    LOG_I("CommTask@Core%d, RenderTask@Core%d\n", COMM_TASK_CORE, RENDER_TASK_CORE);
 }
 
 // Arduino loop() - FreeRTOS任务模式下不再使用，保持最小
@@ -618,6 +593,12 @@ void loop() {
 // ============ 数据解析 ============
 
 void parseServerData(String json) {
+    // --- OOM熔断: 堆剩余不足16KB时跳过解析，防止StaticJson分配失败 ---
+    if (ESP.getFreeHeap() < 16384) {
+        LOG_I("⚠️ OOM circuit breaker: Free=%d B, skip parse\n", ESP.getFreeHeap());
+        return;
+    }
+    
     // --- Phase 1: 快速提取type字段（最小64字节分配）---
     StaticJsonDocument<64> typeDoc;
     deserializeJson(typeDoc, json);
@@ -635,13 +616,15 @@ void parseServerData(String json) {
         
         StaticJsonDocument<256> doc;
         DeserializationError error = deserializeJson(doc, json, DeserializationOption::Filter(filter));
-        if (error) { Serial.printf("[JSON] status parse error: %s\n", error.c_str()); return; }
+        if (error) { LOG_E("status parse error: %s\n", error.c_str()); return; }
         
         JsonObject data = doc["data"];
         // [Step 5] 双缓冲写入：copy front→back, 写back, atomic swap
+        // [FIX-N1] 只load一次frontIdx，防止两次load之间被Core 1 swap导致复制错误buffer
         {
-            int backIdx = 1 - g_frontIdx.load(std::memory_order_acquire);
-            g_displayBuf[backIdx] = g_displayBuf[g_frontIdx.load(std::memory_order_acquire)];
+            int front = g_frontIdx.load(std::memory_order_acquire);
+            int backIdx = 1 - front;
+            g_displayBuf[backIdx] = g_displayBuf[front];
             g_displayBuf[backIdx].agent.status = parseStatus(data["status"] | "offline");
             g_displayBuf[backIdx].agent.processName = data["process"] | "";
             g_displayBuf[backIdx].agent.cpuPercent = data["cpu"] | 0.0;
@@ -655,7 +638,7 @@ void parseServerData(String json) {
         if (!isOtaValidated) {
             esp_ota_mark_app_valid_cancel_rollback();
             isOtaValidated = true;
-            Serial.println("[OTA] New app validated successfully by server packet!");
+            LOG_I("New app validated successfully by server packet!");
         }
     }
     else if (type == "token") {
@@ -669,13 +652,15 @@ void parseServerData(String json) {
         
         StaticJsonDocument<256> doc;
         DeserializationError error = deserializeJson(doc, json, DeserializationOption::Filter(filter));
-        if (error) { Serial.printf("[JSON] token parse error: %s\n", error.c_str()); return; }
+        if (error) { LOG_E("token parse error: %s\n", error.c_str()); return; }
         
         JsonObject data = doc["data"];
         // [Step 5] 双缓冲写入
+        // [FIX-N1] 只load一次frontIdx，防止两次load之间被Core 1 swap
         {
-            int backIdx = 1 - g_frontIdx.load(std::memory_order_acquire);
-            g_displayBuf[backIdx] = g_displayBuf[g_frontIdx.load(std::memory_order_acquire)];
+            int front = g_frontIdx.load(std::memory_order_acquire);
+            int backIdx = 1 - front;
+            g_displayBuf[backIdx] = g_displayBuf[front];
             g_displayBuf[backIdx].tokens.inputTokens = data["input"] | 0;
             g_displayBuf[backIdx].tokens.outputTokens = data["output"] | 0;
             g_displayBuf[backIdx].tokens.totalRequests = data["requests"] | 0;
@@ -697,13 +682,15 @@ void parseServerData(String json) {
         
         StaticJsonDocument<384> doc;
         DeserializationError error = deserializeJson(doc, json, DeserializationOption::Filter(filter));
-        if (error) { Serial.printf("[JSON] weather parse error: %s\n", error.c_str()); return; }
+        if (error) { LOG_E("weather parse error: %s\n", error.c_str()); return; }
         
         JsonObject data = doc["data"];
         // [Step 5] 双缓冲写入
+        // [FIX-N1] 只load一次frontIdx，防止两次load之间被Core 1 swap
         {
-            int backIdx = 1 - g_frontIdx.load(std::memory_order_acquire);
-            g_displayBuf[backIdx] = g_displayBuf[g_frontIdx.load(std::memory_order_acquire)];
+            int front = g_frontIdx.load(std::memory_order_acquire);
+            int backIdx = 1 - front;
+            g_displayBuf[backIdx] = g_displayBuf[front];
             g_displayBuf[backIdx].weather.city = data["city"] | "";
             g_displayBuf[backIdx].weather.temperature = data["temp"] | 0.0;
             g_displayBuf[backIdx].weather.feelsLike = data["feels_like"] | 0.0;
@@ -723,7 +710,7 @@ void parseServerData(String json) {
         int jsonLen = json.length();
         char* writeableBuf = (char*)malloc(jsonLen + 1);
         if (!writeableBuf) {
-            Serial.println("[Main] Failed to alloc temp writeable buf for pixel_data");
+            LOG_E("Failed to alloc temp writeable buf for pixel_data");
             return;
         }
         memcpy(writeableBuf, json.c_str(), jsonLen + 1);
@@ -732,7 +719,7 @@ void parseServerData(String json) {
         StaticJsonDocument<256> pixelDoc;
         DeserializationError err = deserializeJson(pixelDoc, writeableBuf);
         if (err) {
-            Serial.printf("[Main] Pixel JSON parse error: %s\n", err.c_str());
+            LOG_E("Pixel JSON parse error: %s\n", err.c_str());
             free(writeableBuf);
             return;
         }
@@ -743,40 +730,42 @@ void parseServerData(String json) {
         const char* b64Data = nullptr;
         size_t b64Len = 0;
 
-        if (dataObj.is<JsonObject>()) {
+        // ArduinoJson V6兼容：用containsKey代替is<T>/as<T>模板
+        if (dataObj.containsKey("packet_index")) {
             // 格式A: data是对象，含packet_index/total_packets/chunk_base64
-            JsonObject dataMap = dataObj.as<JsonObject>();
-            chunkIndex = dataMap["packet_index"] | 0;
-            int totalPackets = dataMap["total_packets"] | 1;
+            chunkIndex = dataObj["packet_index"] | 0;
+            int totalPackets = dataObj["total_packets"] | 1;
             isLastChunk = (chunkIndex >= totalPackets - 1);
-            b64Data = dataMap["chunk_base64"] | (const char*)nullptr;
+            b64Data = dataObj["chunk_base64"] | (const char*)nullptr;
             if (b64Data) b64Len = strlen(b64Data);
-        } else if (dataObj.is<const char*>()) {
+        } else if (pixelDoc.containsKey("data")) {
             // 格式B: data直接是base64字符串（legacy格式）
             chunkIndex = pixelDoc["chunk"] | 0;
             isLastChunk = pixelDoc["last"] | false;
-            b64Data = dataObj.as<const char*>();
-            b64Len = strlen(b64Data);
+            const char* raw = pixelDoc["data"];
+            if (raw) {
+                b64Data = raw;
+                b64Len = strlen(b64Data);
+            }
         } else {
-            Serial.println("[Main] Pixel: unknown data format");
+            LOG_W("Pixel: unknown data format");
             free(writeableBuf);
             return;
         }
         
-        if (!b64Data || b64Len == 0) { Serial.println("[Main] Pixel: empty base64 data"); free(writeableBuf); return; }
+        if (!b64Data || b64Len == 0) { LOG_E("Pixel: empty base64 data"); free(writeableBuf); return; }
 
         if (chunkIndex == 0) {
             g_pxlBuffer = g_pxlPool;
             g_pxlCapacity = PXL_POOL_SIZE;
             g_pxlOffset = 0;
         }
-        if (!g_pxlBuffer) { Serial.println("[Main] Pixel: buffer alloc failed"); free(writeableBuf); return; }
+        if (!g_pxlBuffer) { LOG_E("Pixel: buffer alloc failed"); free(writeableBuf); return; }
 
         // 预估解码后大小（base64: 每4字节→3字节二进制）
         size_t estimatedDecoded = b64Len * 3 / 4;
         if (g_pxlOffset + estimatedDecoded > g_pxlCapacity) {
-            Serial.printf("[Main] Pixel: overflow! offset=%d est_decoded=%d cap=%d\n",
-                          g_pxlOffset, estimatedDecoded, (int)g_pxlCapacity);
+            LOG_E("Pixel: overflow! offset=%d est_decoded=%d cap=%d\n", g_pxlOffset, estimatedDecoded, (int)g_pxlCapacity);
             free(writeableBuf);
             return;
         }
@@ -789,12 +778,12 @@ void parseServerData(String json) {
                                         (const unsigned char*)b64Data,
                                         b64Len);
         if (ret != 0) {
-            Serial.printf("[Main] Pixel: base64 decode error %d (chunk %d)\n", ret, chunkIndex);
+            LOG_E("Pixel: base64 decode error %d (chunk %d)\n", ret, chunkIndex);
             free(writeableBuf);
             return;
         }
         g_pxlOffset += written;
-        Serial.printf("[Main] Pixel chunk %d decoded: %d bytes, total %d\n", chunkIndex, written, g_pxlOffset);
+        LOG_I("Pixel chunk %d decoded: %d bytes, total %d\n", chunkIndex, written, g_pxlOffset);
 
         // 零拷贝缓冲区可安全释放（b64Data已在decode后不再需要）
         free(writeableBuf);
@@ -804,7 +793,7 @@ void parseServerData(String json) {
             g_pendingPixelBufferPtr = g_pxlPool;
             g_pendingPixelSize = g_pxlOffset;
             g_pendingPixelBufferLoad.store(true);
-            Serial.printf("[Main] Pixel pool ready (%d bytes), pending load on Core 1\n", g_pxlOffset);
+            LOG_I("Pixel pool ready (%d bytes), pending load on Core 1\n", g_pxlOffset);
             // 重置池指针（Core 1加载后数据已复制到PixelPlayer内部）
             g_pxlBuffer = g_pxlPool;
             g_pxlOffset = 0;
@@ -815,25 +804,73 @@ void parseServerData(String json) {
         // pixel_cmd字段少且固定，用StaticJsonDocument即可
         StaticJsonDocument<128> doc;
         DeserializationError error = deserializeJson(doc, json);
-        if (error) { Serial.printf("[JSON] pixel_cmd parse error: %s\n", error.c_str()); return; }
+        if (error) { LOG_E("pixel_cmd parse error: %s\n", error.c_str()); return; }
         
         String action = doc["action"] | "";
         if (action == "play") {
             if (pixelPlayer.isLoaded()) {
                 g_pendingPixelPlay = true;
                 g_pendingPixelPtr = &pixelPlayer;
-                Serial.println("[Main] Pixel play requested");
+                LOG_I("Pixel play requested");
             }
         }
         else if (action == "stop") {
             g_pendingPixelStop = true;
             g_pendingNormalMode = true;
-            Serial.println("[Main] Pixel stop -> normal mode");
+            LOG_I("Pixel stop -> normal mode");
         }
         else if (action == "pause") {
             pixelPlayer.pause();
-            Serial.println("[Main] Pixel paused");
+            LOG_I("Pixel paused");
         }
+    }
+    else if (type == "ping") {
+        // 应用层Ping/Pong心跳回应
+        StaticJsonDocument<64> pingDoc;
+        deserializeJson(pingDoc, json);
+        StaticJsonDocument<128> pong;
+        pong["type"] = "pong";
+        pong["ts"] = millis();
+        pong["ping_ts"] = pingDoc["ts"] | 0;
+        String pongJson;
+        serializeJson(pong, pongJson);
+        comm.sendFramed(pongJson);
+        LOG_I("Pong sent");
+    }
+    else if (type == "thinking_status") {
+        // 思考链状态 (from OTLP ThinkingChainTracker)
+        StaticJsonDocument<256> filter;
+        filter["type"] = true;
+        filter["data"]["state"] = true;
+        filter["data"]["name"] = true;
+        filter["data"]["tool"] = true;
+        filter["data"]["step_count"] = true;
+        
+        StaticJsonDocument<256> tDoc;
+        DeserializationError error = deserializeJson(tDoc, json, DeserializationOption::Filter(filter));
+        if (error) { LOG_E("thinking parse error: %s\n", error.c_str()); return; }
+        
+        JsonObject data = tDoc["data"];
+        String state = data["state"] | "idle";
+        
+        ThinkingState ts = THINK_IDLE;
+        if (state == "thinking") ts = THINK_THINKING;
+        else if (state == "tool_call") ts = THINK_TOOL_CALL;
+        else if (state == "responding") ts = THINK_RESPONDING;
+        else if (state == "error") ts = THINK_ERROR;
+        else if (state == "done") ts = THINK_DONE;
+        
+        {
+            // [FIX-N1] 只load一次frontIdx，防止两次load之间被Core 1 swap
+            int front = g_frontIdx.load(std::memory_order_acquire);
+            int backIdx = 1 - front;
+            g_displayBuf[backIdx] = g_displayBuf[front];
+            g_displayBuf[backIdx].agent.thinkingState = ts;
+            g_frontIdx.store(backIdx, std::memory_order_release);
+        }
+        
+        String toolStr = data["tool"] | "";
+        LOG_I("state=%s tool=%s step=%d\n", state.c_str(), toolStr.c_str(), data["step_count"] | 0);
     }
 }
 

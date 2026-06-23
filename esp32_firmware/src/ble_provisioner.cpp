@@ -11,6 +11,7 @@
  */
 
 #include "ble_provisioner.h"
+#include "log.h"
 
 #ifdef BLE_PROVISIONING_ENABLED  // 条件编译：未定义时整个模块不参与编译
 
@@ -32,13 +33,13 @@ public:
     ServerCallbacks(BLEProvisioner* parent) : _parent(parent) {}
     
     void onConnect(NimBLEServer* pServer) override {
-        Serial.println("[BLE] Client connected");
+        LOG_I("Client connected");
         // 连接后停止广播节省电量
         pServer->stopAdvertising();
     }
     
     void onDisconnect(NimBLEServer* pServer) override {
-        Serial.println("[BLE] Client disconnected, restarting advertising");
+        LOG_I("Client disconnected, restarting advertising");
         // 断开后重新广播，等待重连
         if (_parent->_active && !_parent->_provisioned) {
             pServer->startAdvertising();
@@ -55,7 +56,7 @@ public:
     
     void onWrite(NimBLECharacteristic* pChar) override {
         _parent->_ssid = pChar->getValue().c_str();
-        Serial.printf("[BLE] SSID received: %s\n", _parent->_ssid.c_str());
+        LOG_I("SSID received: %s\n", _parent->_ssid.c_str());
     }
     
 private:
@@ -68,11 +69,11 @@ public:
     
     void onWrite(NimBLECharacteristic* pChar) override {
         _parent->_password = pChar->getValue().c_str();
-        Serial.println("[BLE] Password received");
+        LOG_I("Password received");
         // 收到密码后标记配网完成(SSID必须已设置)
         if (_parent->_ssid.length() > 0) {
             _parent->_provisioned = true;
-            Serial.println("[BLE] Provisioning complete, will attempt WiFi connect");
+            LOG_I("Provisioning complete, will attempt WiFi connect");
         }
     }
     
@@ -86,7 +87,7 @@ public:
     
     void onWrite(NimBLECharacteristic* pChar) override {
         _parent->_host = pChar->getValue().c_str();
-        Serial.printf("[BLE] Host received: %s\n", _parent->_host.c_str());
+        LOG_I("Host received: %s\n", _parent->_host.c_str());
     }
     
 private:
@@ -100,7 +101,7 @@ public:
     void onWrite(NimBLECharacteristic* pChar) override {
         std::string val = pChar->getValue();
         _parent->_port = atoi(val.c_str());
-        Serial.printf("[BLE] Port received: %d\n", _parent->_port);
+        LOG_I("Port received: %d\n", _parent->_port);
     }
     
 private:
@@ -121,7 +122,7 @@ BLEProvisioner::~BLEProvisioner() {
 
 bool BLEProvisioner::startProvisioning(uint32_t timeoutMs) {
     if (_active) {
-        Serial.println("[BLE] Already active");
+        LOG_I("Already active");
         return false;
     }
     
@@ -132,22 +133,49 @@ bool BLEProvisioner::startProvisioning(uint32_t timeoutMs) {
     _host = "";
     _port = 8080;
     
-    Serial.println("[BLE] Starting provisioning...");
+    LOG_I("Starting provisioning...");
     
-    // 初始化NimBLE
+    // 初始化BLE协议栈并启动广播
+    if (!initBLEService()) {
+        LOG_E("Failed to init BLE service");
+        stop();
+        return false;
+    }
+    
+    _active = true;
+    _startTime = millis();
+    
+    LOG_W("Advertising as '%s', timeout: %s\n", BLE_DEVICE_NAME, timeoutMs > 0 ? String(timeoutMs / 1000) + "s" : "none");
+    
+    // 阻塞等待配网完成或超时
+    if (!waitForProvisioning()) {
+        return false;
+    }
+    
+    // 配网成功：保存凭证到Preferences
+    Preferences prefs;
+    prefs.begin(PREF_NAMESPACE, false);
+    prefs.putString("ssid", _ssid);
+    prefs.putString("password", _password);
+    if (_host.length() > 0) prefs.putString("host", _host);
+    if (_port > 0) prefs.putUShort("port", _port);
+    prefs.end();
+    
+    LOG_I("Credentials saved to Preferences");
+    stop();
+    return true;
+}
+
+// 初始化BLE协议栈：创建Server/Service/Characteristics并启动广播
+bool BLEProvisioner::initBLEService() {
     NimBLEDevice::init(BLE_DEVICE_NAME);
+    NimBLEDevice::setPower(ESP_PWR_LVL_P3);  // ~0dBm，配网距离不需要远
     
-    // 设置发射功率(降低功耗，配网距离不需要远)
-    NimBLEDevice::setPower(ESP_PWR_LVL_P3);  // ~0dBm
-    
-    // 创建Server
     _server = NimBLEDevice::createServer();
     _server->setCallbacks(new ServerCallbacks(this));
     
-    // 创建Service
     _service = _server->createService(SERVICE_UUID);
     
-    // 创建Characteristics
     // SSID: Read + Write
     NimBLECharacteristic* ssidChar = _service->createCharacteristic(
         SSID_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
@@ -171,55 +199,31 @@ bool BLEProvisioner::startProvisioning(uint32_t timeoutMs) {
     portChar->setCallbacks(new PortCallback(this));
     portChar->setValue("8080");
     
-    // 启动Service
     _service->start();
     
-    // 配置Advertising
     _advertising = NimBLEDevice::getAdvertising();
     _advertising->addServiceUUID(SERVICE_UUID);
     _advertising->setScanResponse(true);
     _advertising->setMinPreferred(0x06);  // 有助于iPhone连接
     _advertising->start();
     
-    _active = true;
-    _startTime = millis();
-    
-    Serial.printf("[BLE] Advertising as '%s', timeout: %s\n", 
-                  BLE_DEVICE_NAME,
-                  timeoutMs > 0 ? String(timeoutMs / 1000) + "s" : "none");
-    
-    // 阻塞等待配网完成或超时
+    return true;
+}
+
+// 阻塞等待配网完成或超时
+bool BLEProvisioner::waitForProvisioning() {
     while (_active && !_provisioned) {
         delay(100);
         
-        // 超时检查
         if (_timeoutMs > 0 && (millis() - _startTime) > _timeoutMs) {
-            Serial.println("[BLE] Provisioning timeout");
+            LOG_W("Provisioning timeout");
             stop();
             return false;
         }
         
-        // yield给其他任务(避免看门狗)
-        yield();
+        yield();  // 避免看门狗超时
     }
-    
-    if (_provisioned) {
-        // 保存到Preferences
-        Preferences prefs;
-        prefs.begin(PREF_NAMESPACE, false);
-        prefs.putString("ssid", _ssid);
-        prefs.putString("password", _password);
-        if (_host.length() > 0) prefs.putString("host", _host);
-        if (_port > 0) prefs.putUShort("port", _port);
-        prefs.end();
-        
-        Serial.println("[BLE] Credentials saved to Preferences");
-        stop();
-        return true;
-    }
-    
-    stop();
-    return false;
+    return _provisioned;
 }
 
 void BLEProvisioner::stop() {
@@ -231,7 +235,7 @@ void BLEProvisioner::stop() {
     _server = nullptr;
     
     NimBLEDevice::deinit(true);  // true = release memory
-    Serial.println("[BLE] Stopped, memory released");
+    LOG_I("Stopped, memory released");
 }
 
 #endif // BLE_PROVISIONING_ENABLED

@@ -1,5 +1,6 @@
 #include "sound_manager.h"
 #include "sin_lut.h"
+#include "log.h"
 
 // ============ ISR静态变量 ============
 static volatile uint8_t  s_sinIdx = 0;      // LUT索引
@@ -67,10 +68,11 @@ void SoundManager::begin() {
     ledcAttachPin(BUZZER_PIN, 0);
 #endif
     _initialized = true;
-    Serial.println("[Sound] Initialized on GPIO " + String(BUZZER_PIN));
+    LOG_I("Initialized on GPIO %s", (String(BUZZER_PIN)).c_str());
 }
 
 // ============ 方波蜂鸣（兼容原有接口）============
+// 阻塞时长: 15-200ms per tone。ESP32 delay()=vTaskDelay()，同核其他任务可继续运行
 void SoundManager::beep(uint16_t freq, uint16_t duration) {
     if (!_enabled || !_initialized) return;
 #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3,0,0)
@@ -85,6 +87,7 @@ void SoundManager::beep(uint16_t freq, uint16_t duration) {
 }
 
 // ============ 正弦波柔和音调（苹果级听感）============
+// 阻塞时长: 30-200ms per tone。delay()=vTaskDelay()，WiFi栈不受影响
 void SoundManager::beepSine(uint16_t freq, uint16_t duration) {
     if (!_enabled || !_initialized) return;
     
@@ -138,7 +141,7 @@ void SoundManager::_startSineTimer() {
     config.auto_reload = TIMER_AUTORELOAD_EN;
     timer_init(TIMER_GROUP_0, TIMER_0, &config);
     timer_set_alarm_value(TIMER_GROUP_0, TIMER_0, 1000000 / PWM_CARRIER_HZ);  // 25 ticks @ 40kHz
-    timer_enable_interrupt(TIMER_GROUP_0, TIMER_0);
+    timer_enable_intr(TIMER_GROUP_0, TIMER_0);
     timer_isr_register(TIMER_GROUP_0, TIMER_0, sineTimerISR, nullptr, 0, &handle);
     timer_start(TIMER_GROUP_0, TIMER_0);
 #endif
@@ -162,6 +165,7 @@ void SoundManager::_stopSineTimer() {
 #if __has_include(<driver/i2s_pdm.h>)
 // ========== ESP-IDF v5.x / Arduino-ESP32 v3.x 新API ==========
 #include <driver/i2s_pdm.h>
+#include "log.h"
 
 static i2s_chan_handle_t s_i2sTxChan = nullptr;
 
@@ -173,7 +177,7 @@ void SoundManager::_initI2S() {
 
     esp_err_t err = i2s_new_channel(&chan_cfg, &s_i2sTxChan, nullptr);
     if (err != ESP_OK) {
-        Serial.printf("[Sound] I2S new_channel failed: %d\n", err);
+        LOG_E("I2S new_channel failed: %d\n", err);
         _audioMode = AUDIO_PWM;
         return;
     }
@@ -188,7 +192,7 @@ void SoundManager::_initI2S() {
 
     err = i2s_channel_init_pdm_tx_mode(s_i2sTxChan, &pdm_cfg);
     if (err != ESP_OK) {
-        Serial.printf("[Sound] I2S PDM TX init failed: %d\n", err);
+        LOG_E("I2S PDM TX init failed: %d\n", err);
         i2s_del_channel(s_i2sTxChan);
         s_i2sTxChan = nullptr;
         _audioMode = AUDIO_PWM;
@@ -197,7 +201,7 @@ void SoundManager::_initI2S() {
 
     err = i2s_channel_enable(s_i2sTxChan);
     if (err != ESP_OK) {
-        Serial.printf("[Sound] I2S channel enable failed: %d\n", err);
+        LOG_E("I2S channel enable failed: %d\n", err);
         i2s_del_channel(s_i2sTxChan);
         s_i2sTxChan = nullptr;
         _audioMode = AUDIO_PWM;
@@ -205,7 +209,7 @@ void SoundManager::_initI2S() {
     }
 
     _i2sInitialized = true;
-    Serial.println("[Sound] I2S-PDM v5.x initialized on GPIO " + String(BUZZER_PIN));
+    LOG_I("I2S-PDM v5.x initialized on GPIO %s", (String(BUZZER_PIN)).c_str());
 }
 
 #else
@@ -231,14 +235,14 @@ void SoundManager::_initI2S() {
 
     esp_err_t err = i2s_driver_install(I2S_NUM_0, &i2s_config, 0, nullptr);
     if (err != ESP_OK) {
-        Serial.printf("[Sound] I2S install failed: %d, falling back to PWM\n", err);
+        LOG_E("I2S install failed: %d, falling back to PWM\n", err);
         _audioMode = AUDIO_PWM;
         return;
     }
     i2s_set_pin(I2S_NUM_0, &pin_config);
     i2s_set_clk(I2S_NUM_0, 44100, I2S_BITS_PER_SAMPLE_8BIT, I2S_CHANNEL_MONO);
     _i2sInitialized = true;
-    Serial.println("[Sound] I2S-PDM v4.x initialized on GPIO " + String(BUZZER_PIN));
+    LOG_I("I2S-PDM v4.x initialized on GPIO %s", (String(BUZZER_PIN)).c_str());
 }
 #endif  // __has_include(<driver/i2s_pdm.h>)
 
@@ -312,6 +316,8 @@ void SoundManager::setAudioMode(AudioMode mode) {
 }
 #endif  // SOUND_I2S_PDM_ENABLED
 // ============ 复合音效 ============
+// 注意: 复合音效串行播放多段tone，总阻塞 ~100-650ms
+// ESP32 delay()=vTaskDelay()不会阻塞WiFi栈，仅暂停当前task
 void SoundManager::beepPattern(uint16_t freq, uint16_t onMs, uint16_t offMs, uint8_t count) {
     for (uint8_t i = 0; i < count; i++) {
         beep(freq, onMs);
@@ -319,6 +325,7 @@ void SoundManager::beepPattern(uint16_t freq, uint16_t onMs, uint16_t offMs, uin
     }
 }
 
+// 总阻塞 ~440ms (80+80+80+80+120)
 void SoundManager::playStartup() {
     beepSine(1000, 80);
     delay(80);
@@ -327,12 +334,14 @@ void SoundManager::playStartup() {
     beepSine(2000, 120);
 }
 
+// 总阻塞 ~160ms (60+40+60)
 void SoundManager::playNotification() {
     beepSine(2500, 60);
     delay(40);
     beepSine(2500, 60);
 }
 
+// 总阻塞 ~650ms (beepPattern 3×150 + 2×100)
 void SoundManager::playAlert() {
     beepPattern(1500, 150, 100, 3);
 }
@@ -341,6 +350,7 @@ void SoundManager::playOtaProgress() {
     beepSine(1800, 30);
 }
 
+// 总阻塞 ~600ms (100+100+100+100+200)
 void SoundManager::playOtaSuccess() {
     beepSine(1000, 100);
     delay(100);
@@ -349,6 +359,7 @@ void SoundManager::playOtaSuccess() {
     beepSine(2000, 200);
 }
 
+// 总阻塞 ~900ms (beepPattern 3×200 + 2×100)
 void SoundManager::playOtaFail() {
     beepPattern(800, 200, 100, 3);
 }

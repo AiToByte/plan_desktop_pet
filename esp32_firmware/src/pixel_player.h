@@ -91,6 +91,8 @@ private:
     // [Step 6] 显式size_t转换，防止uint16_t乘法溢出
     size_t getFrameSize() const { return (size_t)_header.width * (size_t)_header.height * 2; }
     bool rleDecompress(const uint8_t* compressed, size_t compLen, uint16_t* output, size_t pixelCount);
+    bool allocPSRAMPBuffer(size_t totalSize);
+    bool loadFrameData(const uint8_t* data, size_t len);
 };
 
 #endif // PIXEL_PLAYER_H

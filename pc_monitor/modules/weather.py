@@ -195,10 +195,10 @@ class WeatherService:
             WeatherInfo对象，解析失败返回None
         """
         try:
-            main: Dict[str, Any] = data.get("main", {})
-            weather_list: list = data.get("weather", [{}])
+            main: Dict[str, Any] = data.get("main") or {}
+            weather_list: list = data.get("weather") or []
             weather: Dict[str, Any] = weather_list[0] if weather_list else {}
-            wind: Dict[str, Any] = data.get("wind", {})
+            wind: Dict[str, Any] = data.get("wind") or {}
             
             return WeatherInfo(
                 city=str(data.get("name", self.city)),
