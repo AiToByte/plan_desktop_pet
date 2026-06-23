@@ -158,12 +158,30 @@ void WebConfig::handleReset() {
     ESP.restart();
 }
 
+// [FIX-BUG3] JSON字符串转义：处理特殊字符防止响应格式破坏
+static String escapeJsonString(const String& input) {
+    String out;
+    out.reserve(input.length() + 16);
+    for (unsigned int i = 0; i < input.length(); i++) {
+        char c = input.charAt(i);
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:   out += c;      break;
+        }
+    }
+    return out;
+}
+
 void WebConfig::handleStatus() {
     String json = "{";
     json += "\"state\":\"" + String(_state) + "\",";
     json += "\"valid\":" + String(_config.valid ? "true" : "false") + ",";
-    json += "\"ssid\":\"" + _config.wifi_ssid + "\",";
-    json += "\"server\":\"" + _config.server_host + ":" + String(_config.server_port) + "\"";
+    json += "\"ssid\":\"" + escapeJsonString(_config.wifi_ssid) + "\",";
+    json += "\"server\":\"" + escapeJsonString(_config.server_host) + ":" + String(_config.server_port) + "\"";
     json += "}";
     _server->send(200, "application/json", json);
 }

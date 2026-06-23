@@ -98,11 +98,15 @@ bool HapticDriver::begin(int sdaPin, int sclPin) {
     calibrate();
     
     // 校准后重新配置工作模式
-    _writeRegister(REG_MODE, MODE_INTERNAL);
-    _writeRegister(REG_LIBRARY, 0x06);  // Library 6 for LRA
-    _writeRegister(REG_CONTROL1, 0x93);
-    _writeRegister(REG_CONTROL2, 0xF5);
-    _writeRegister(REG_CONTROL3, 0xA0);
+    // [FIX-BUG5] 检查I2C写入返回值，失败时记录并标记驱动不可用
+    if (!_writeRegister(REG_MODE, MODE_INTERNAL) ||
+        !_writeRegister(REG_LIBRARY, 0x06) ||  // Library 6 for LRA
+        !_writeRegister(REG_CONTROL1, 0x93) ||
+        !_writeRegister(REG_CONTROL2, 0xF5) ||
+        !_writeRegister(REG_CONTROL3, 0xA0)) {
+        LOG_W("I2C write failed during calibration re-configure, haptic may be unreliable\n");
+        // 不设为不可用，因为校准已完成，驱动仍可尝试工作
+    }
     
     LOG_I("Ready for playback");
     return true;

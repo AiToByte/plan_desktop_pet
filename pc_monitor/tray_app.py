@@ -162,32 +162,66 @@ class StatusPanel(tk.Toplevel):
             self.ax.set_xticklabels([x[i] for i in tick_pos], fontsize=7)
         self.canvas.draw_idle()
 
+    def _get_monitor_bounds(self, mx, my):
+        """[OPT-5] 用ctypes获取鼠标所在单显示器的精确工作区边界"""
+        try:
+            import ctypes
+            from ctypes import wintypes
+            
+            # MONITORINFOEXW 结构体
+            class MONITORINFOEXW(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", wintypes.DWORD),
+                    ("rcMonitor", wintypes.RECT),
+                    ("rcWork", wintypes.RECT),
+                    ("dwFlags", wintypes.DWORD),
+                    ("szDevice", wintypes.WCHAR * 32),
+                ]
+            
+            MONITOR_DEFAULTTONEAREST = 2
+            
+            # 从鼠标坐标获取最近的显示器句柄
+            pt = wintypes.POINT(mx, my)
+            hmon = ctypes.windll.user32.MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST)
+            
+            mi = MONITORINFOEXW()
+            mi.cbSize = ctypes.sizeof(MONITORINFOEXW)
+            
+            if ctypes.windll.user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                # rcWork 是排除任务栏的工作区
+                return (mi.rcWork.left, mi.rcWork.top,
+                        mi.rcWork.right, mi.rcWork.bottom)
+        except Exception:
+            pass
+        return None
+
     def _position_on_current_monitor(self):
-        """多显示器适配：根据鼠标位置定位panel到当前显示器可见区域"""
+        """[OPT-5] 多显示器适配：用单显示器边界钉扎窗口位置"""
         self.update_idletasks()  # 确保winfo获取准确尺寸
         panel_w, panel_h = 400, 300
         # 获取鼠标当前位置（跨显示器准确）
-        mx, py = self.winfo_pointerx(), self.winfo_pointery()
-        # 获取鼠标所在屏幕的范围
-        screen_w = self.winfo_screenwidth()
-        screen_h = self.winfo_screenheight()
-        # 尝试用tkinter内置方法检测多显示器边界
-        # winfo_vrootwidth/height 返回虚拟桌面总尺寸（多显示器时大于单屏）
-        vroot_w = self.winfo_vrootwidth()
-        vroot_h = self.winfo_vrootheight()
-        vroot_x = self.winfo_vrootx()
-        vroot_y = self.winfo_vrooty()
-        # 计算：panel放在鼠标右下方，但不超出当前显示器可视区域
-        # 简单策略：如果鼠标在虚拟桌面范围内，用鼠标位置偏移
-        # 否则回退到主屏幕中央
-        if vroot_w > screen_w:
-            # 多显示器环境：使用虚拟桌面坐标
-            x = min(mx + 20, vroot_x + vroot_w - panel_w - 10)
-            y = min(py + 20, vroot_y + vroot_h - panel_h - 10)
+        mx, my = self.winfo_pointerx(), self.winfo_pointery()
+        
+        # 尝试获取鼠标所在单显示器的工作区边界
+        bounds = self._get_monitor_bounds(mx, my)
+        
+        if bounds:
+            mon_l, mon_t, mon_r, mon_b = bounds
+            mon_w = mon_r - mon_l
+            mon_h = mon_b - mon_t
+            # 在鼠标右下方偏移20px
+            x = mx + 20
+            y = my + 20
+            # 钉扎到单显示器可视区域内（确保不超出当前显示器边缘）
+            x = max(mon_l, min(x, mon_r - panel_w))
+            y = max(mon_t, min(y, mon_b - panel_h))
         else:
-            # 单显示器：居中
+            # fallback：单显示器或ctypes失败，用tkinter方法居中
+            screen_w = self.winfo_screenwidth()
+            screen_h = self.winfo_screenheight()
             x = (screen_w - panel_w) // 2
             y = (screen_h - panel_h) // 2
+        
         x = max(x, 0)
         y = max(y, 0)
         self.geometry(f"{panel_w}x{panel_h}+{x}+{y}")

@@ -8,7 +8,7 @@
 
 // Web配网配置
 #define AP_SSID "Pet-Setup"
-#define AP_PASSWORD "12345678"
+#define AP_PASSWORD "pet"  // [FIX-SEC1] 临时默认值，启动时根据MAC生成唯一密码并覆盖(见web_config init)
 #define CONFIG_PORT 80
 #define CONFIG_TIMEOUT 120000  // 配网超时2分钟
 

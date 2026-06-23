@@ -63,6 +63,7 @@ class OTLPReceiver:
         self._running = False
         self._span_callback: Optional[Callable[[OTLPSpan], None]] = None
         self._health_callback: Optional[Callable[[], Dict]] = None
+        self._auth_token: Optional[str] = None  # [FIX-SEC2] OTLP认证token
     
     def set_span_callback(self, callback: Callable[[OTLPSpan], None]):
         """设置 span 回调（每收到一个 span 触发一次）"""
@@ -125,6 +126,15 @@ class OTLPReceiver:
             
             def _handle_traces(self):
                 """解析 OTLP traces JSON 并提取 spans"""
+                # [FIX-SEC2] Token认证：如果配置了token则必须校验
+                if receiver._auth_token:
+                    auth_header = self.headers.get("Authorization", "")
+                    # 支持 "Bearer <token>" 和直接 "<token>" 两种格式
+                    token = auth_header.replace("Bearer ", "").strip() if auth_header else ""
+                    if token != receiver._auth_token:
+                        logger.warning(f"OTLP auth failed from {self.client_address[0]}")
+                        self.send_error(401, "Unauthorized")
+                        return
                 try:
                     content_length = int(self.headers.get("Content-Length", 0))
                     if content_length == 0:

@@ -11,6 +11,7 @@ import threading
 from typing import Callable, Optional
 from queue import Queue, Empty
 import struct
+import random  # [FIX-BUG4] 指数退避需要随机抖动
 from dataclasses import dataclass, field
 
 # 默认配置常量
@@ -30,6 +31,7 @@ SERIAL_READ_POLL_INTERVAL = 0.01
 ERROR_RECOVERY_DELAY = 0.1
 BROADCAST_SLEEP_STEP = 0.1
 RECV_BUFFER_SIZE = 4096
+MAX_FRAME_LEN = 128 * 1024    # [FIX-C3] 与ESP32端PXL_POOL_SIZE一致(128KB)，避免单帧OOM风险
 MDNS_HOSTNAME = "deskpet.local"
 # Keep-Alive 配置
 KEEPALIVE_INTERVAL = 10    # 每10秒发送ping
@@ -156,6 +158,11 @@ class SerialCommunication(CommunicationBase):
                     # 重连成功，继续发送
                 else:
                     self._reconnect_attempts += 1
+                    # [FIX-BUG4] 指数退避 + 随机抖动，防止多设备同时重连风暴
+                    self._reconnect_delay = min(
+                        DEFAULT_RECONNECT_DELAY * (2 ** (self._reconnect_attempts - 1)),
+                        30.0  # 最大延迟上限30秒
+                    ) + random.uniform(0, 1)
                     time.sleep(self._reconnect_delay)
                     return False
             else:
@@ -167,6 +174,10 @@ class SerialCommunication(CommunicationBase):
                 "data": msg.data,
                 "ts": msg.timestamp
             })
+            # [FIX-BUG1] 发送前检查payload大小，与ESP32端帧长度上限一致
+            if len(payload) > MAX_FRAME_LEN:
+                logger.warning(f"Payload大小({len(payload)})超过帧上限({MAX_FRAME_LEN})，拒绝发送")
+                return False
             frame = f"LEN:{len(payload)}\n{payload}\n"
             self._serial.write(frame.encode('utf-8'))
             self._reconnect_attempts = 0  # 发送成功，重置重连计数
@@ -424,43 +435,20 @@ class WiFiCommunication(CommunicationBase):
         logger.info("TCP Server 已关闭")
     
     def send_message(self, msg: DeviceMessage) -> bool:
-        """发送消息到已连接的ESP32（带长度前缀帧）"""
-        need_sleep = False
-        with self._lock:
-            if not self._client_socket:
-                if self._reconnect_attempts < self._max_reconnect_attempts:
-                    logger.info(f"无客户端连接，等待新连接 ({self._reconnect_attempts + 1}/{self._max_reconnect_attempts})")
-                    self._reconnect_attempts += 1
-                    need_sleep = True
-                if need_sleep:
-                    pass  # sleep在锁外执行
-                else:
-                    return False
-            else:
-                try:
-                    payload = json.dumps({
-                        "type": msg.msg_type,
-                        "data": msg.data,
-                        "ts": msg.timestamp
-                    })
-                    frame = f"LEN:{len(payload)}\n{payload}\n"
-                    self._client_socket.sendall(frame.encode('utf-8'))
-                    self._reconnect_attempts = 0
-                    return True
-                except Exception as e:
-                    logger.error(f"发送消息失败: {e}")
-                    self._client_socket = None
-                    self._client_addr = None
-                    self._connected = False
-                    if self._reconnect_attempts < self._max_reconnect_attempts:
-                        logger.info(f"发送失败，等待新连接 ({self._reconnect_attempts + 1}/{self._max_reconnect_attempts})")
-                        self._reconnect_attempts += 1
-                        need_sleep = True
-        
-        # sleep在锁外执行，避免阻塞其他线程
-        if need_sleep:
-            time.sleep(self._reconnect_delay)
-        return False
+        """发送消息到已连接的ESP32（非阻塞入队，由worker线程异步发送）"""
+        try:
+            self._send_queue.put_nowait(msg)
+            return True
+        except Exception:
+            # 队列满，丢弃最旧消息腾出空间
+            try:
+                self._send_queue.get_nowait()  # 丢弃最旧
+                self._send_queue.put_nowait(msg)
+                logger.warning("发送队列已满，丢弃最旧消息")
+                return True
+            except Exception:
+                logger.error("发送队列溢出，消息丢失")
+                return False
     
 
     def _send_queue_worker(self):
@@ -478,6 +466,10 @@ class WiFiCommunication(CommunicationBase):
     def _flush_send(self, msg):
         """底层同步发送：序列化+帧协议发送（被队列worker和keepalive调用）"""
         payload = json.dumps({"type": msg.msg_type, "data": msg.data, "ts": msg.timestamp})
+        # [FIX-BUG1] 发送前检查payload大小，与ESP32端帧长度上限一致
+        if len(payload) > MAX_FRAME_LEN:
+            logger.warning(f"Socket payload大小({len(payload)})超过帧上限({MAX_FRAME_LEN})，拒绝发送")
+            return
         frame = f"LEN:{len(payload)}\n{payload}\n"
         with self._lock:
             if self._client_socket and self._connected:

@@ -301,4 +301,27 @@ else if (action == "pause") {
 
 ---
 
+## 八、修复状态汇总 (2026-06-23)
+
+| 编号 | 类型 | 问题 | 状态 | 修改文件 |
+|------|------|------|------|----------|
+| BUG-1 | 🔴Bug | Serial/Socket帧大小未检查 | ✅已修复 | communication.py 行178-179, 470-471 |
+| BUG-2 | 🔴Bug | pixel_cmd pause后无法resume | ✅已修复 | main.cpp 行823+ (toggle逻辑) |
+| BUG-3 | 🔴Bug | JSON字符串转义缺失 | ✅已修复 | main.cpp 行670-674 |
+| BUG-4 | 🔴Bug | reconnect无指数退避 | ✅已修复 | communication.py 行150+ |
+| BUG-5 | 🔴Bug | haptic_driver init返回值忽略 | ✅已修复 | haptic_driver.cpp |
+| SEC-1 | 🔴安全 | AP默认密码"12345678" | ✅已修复 | config.h |
+| SEC-2 | 🔴安全 | OTLP无认证 | ✅已修复 | otlp_receiver.py + main.py _auth_token |
+| C3 | 🟡优化 | MAX_FRAME_LEN 256KB过大 | ✅已修复 | communication.py 行34 (128KB) |
+| M4 | 🟡优化 | comm_manager帧body无溢出检查 | ✅已修复 | comm_manager.cpp 行193+ |
+| N1 | 🟡注意 | ESP32双缓冲double-load | ✅已有(5处全修) | main.cpp [FIX-N1] |
+| N2 | 🟡注意 | BH1750双重readLux | ✅已有 | main.cpp [FIX-N2] |
+| C2 | 🟡注意 | weather API float异常 | ✅已有 | weather.py try/except line 213 |
+| N4 | 🟢注意 | restart逻辑单实例锁 | ❌不适用 | main.py无restart_app函数 |
+| N3 | 🟢注意 | WiFi事件回调内存泄漏 | ⏳待评估 | wifi_manager.cpp |
+| N5 | 🟢注意 | pixel_cmd pause | ✅已含于BUG-2 | main.cpp |
+| N6 | 🟢注意 | OTLP无认证 | ✅已含于SEC-2 | otlp_receiver.py |
+
+---
+
 *分析完成。建议优先修复N1(双缓冲竞态)和N2(双重readLux), 这两个是明确的代码bug且修复成本极低。*

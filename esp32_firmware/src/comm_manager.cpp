@@ -199,6 +199,13 @@ void CommManager::update() {
                         _expectedLen = 0;
                         _frameState = FRAME_IDLE;
                     }
+                    // [FIX-M4] 防止帧长度声明过大导致OOM（匹配PC端128KB限制）
+                    if ((int)_frameBuffer.length() > 128 * 1024) {
+                        LOG_E("Frame body overflow (>128KB), reset");
+                        _frameBuffer = "";
+                        _expectedLen = 0;
+                        _frameState = FRAME_IDLE;
+                    }
                     break;
                     
                 case FRAME_LEGACY_LINE:
