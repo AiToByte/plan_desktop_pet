@@ -16,6 +16,7 @@
 #define PXL_MAX_FRAMES    64
 #define PXL_FLAG_LOOP     0x0001
 #define PXL_FLAG_RLE      0x0002
+#define PXL_FLAG_DELTA    0x0004
 
 // PXL文件头结构 (16字节, packed)
 #pragma pack(push, 1)
@@ -91,6 +92,7 @@ private:
     // [Step 6] 显式size_t转换，防止uint16_t乘法溢出
     size_t getFrameSize() const { return (size_t)_header.width * (size_t)_header.height * 2; }
     bool rleDecompress(const uint8_t* compressed, size_t compLen, uint16_t* output, size_t pixelCount);
+    bool deltaDecompress(const uint8_t* deltaData, size_t deltaLen, const uint16_t* prevFrame, uint16_t* output, size_t pixelCount);
     bool allocPSRAMPBuffer(size_t totalSize);
     bool loadFrameData(const uint8_t* data, size_t len);
 };

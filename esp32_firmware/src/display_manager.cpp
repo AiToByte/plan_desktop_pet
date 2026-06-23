@@ -105,6 +105,7 @@ void DisplayManager::showBootScreen(String message) {
     }
     bootFrame++;
 
+    _lcd.waitDMA();  // 等待上一帧DMA传输完成
     _sprite.pushSprite(&_lcd, 0, 0);
 }
 
@@ -112,6 +113,9 @@ void DisplayManager::showBootScreen(String message) {
 
 void DisplayManager::update(const DisplayData& data) {
     _currentStatus = data.agent.status;
+
+    // 等待上一帧DMA传输完成，避免CPU覆盖正在传输的缓冲区
+    _lcd.waitDMA();
 
     // 缓存原始数据 + 更新弹簧目标值
     _lastData = data;
@@ -134,7 +138,7 @@ void DisplayManager::update(const DisplayData& data) {
     _sprite.fillScreen(COLOR_BG);
     drawHeader();
     drawStatusBar(data.agent);
-    drawThinkingIndicator(data.agent.thinkingState, 0);
+    drawThinkingIndicator(data);
     drawWeatherPanel(data.weather);
     drawTokenPanel(data.tokens);
     drawFaceAnimation();
@@ -176,6 +180,8 @@ void DisplayManager::updateAnimation() {
         drawFace(faceX, faceY, _currentFace, _animFrame);
 
         // 脏矩形：仅推送表情动画区域（约240×40 vs 全屏240×240，减少80% SPI传输）
+        // 等待上一帧DMA传输完成，避免CPU覆盖正在传输的缓冲区
+        _lcd.waitDMA();
         _lcd.setClipRect(0, faceY - 4, SCREEN_WIDTH, FACE_SIZE + 8);
         _sprite.pushSprite(&_lcd, 0, 0);
         _lcd.clearClipRect();
@@ -962,6 +968,7 @@ void DisplayManager::drawClock() {
     // 离线状态指示灯（灰色）
     _sprite.fillCircle(SCREEN_WIDTH - 15, 15, 5, COLOR_OFFLINE);
 
+    _lcd.waitDMA();  // 等待上一帧DMA传输完成
     _sprite.pushSprite(&_lcd, 0, 0);
 }
 
@@ -1038,6 +1045,7 @@ void DisplayManager::_fadeBlend() {
 
         // 将混合结果拷贝到_sprite并推送
         memcpy(newBuf, blendBuf, totalPixels * 2);
+        _lcd.waitDMA();  // 等待上一帧DMA传输完成
         _sprite.pushSprite(&_lcd, 0, 0);
 
         _fadeFrame++;
@@ -1052,16 +1060,20 @@ void DisplayManager::_fadeBlend() {
     // s_fadeBlendBuf is static, no free needed
 }
 
-void DisplayManager::drawThinkingIndicator(ThinkingState state, uint8_t stepCount) {
-    if (state == THINK_IDLE) return;
-    
+void DisplayManager::drawThinkingIndicator(const DisplayData& data) {
+    ThinkingState state = data.agent.thinkingState;
+    uint8_t stepCount = 0;  // 历史步数由thinkingHistory管理
+
     int x = SCREEN_WIDTH - 60;
     int y = 2;
     int w = 58;
     int h = 10;
-    
+
+    // 状态指示区始终绘制（只要非IDLE就显示）
+    if (state == THINK_IDLE && (!data.thinkingHistory || data.thinkingHistory->isEmpty())) return;
+
     _sprite.fillRect(x, y, w, h, COLOR_PANEL);
-    
+
     uint16_t dotColor;
     const char* label;
     switch (state) {
@@ -1070,26 +1082,181 @@ void DisplayManager::drawThinkingIndicator(ThinkingState state, uint8_t stepCoun
         case THINK_RESPONDING:dotColor = 0x001F; label = "resp";  break;  // blue
         case THINK_ERROR:     dotColor = 0xF800; label = "err";   break;  // red
         case THINK_DONE:      dotColor = 0x07E0; label = "done";  break;  // green
-        default: return;
+        default:              dotColor = 0x8410; label = "hist";  break;  // gray=仅历史
     }
-    
+
     // Blinking dot
     static uint8_t blink = 0;
     blink++;
     if (blink & 0x04) {
         _sprite.fillCircle(x + 4, y + 5, 3, dotColor);
     }
-    
+
     _sprite.setTextSize(1);
     _sprite.setTextColor(0xFFFF);
     _sprite.setCursor(x + 10, y + 2);
     _sprite.print(label);
-    
-    // Step count
-    if (stepCount > 0) {
+
+    // 显示历史总步数
+    if (data.thinkingHistory && data.thinkingHistory->getCount() > 0) {
         _sprite.setCursor(x + 36, y + 2);
-        _sprite.printf("%d", stepCount);
+        _sprite.printf("%d", data.thinkingHistory->getCount());
     }
+
+    // [OPT-1] 思考链历史滚动展示 (PSRAM环形缓冲)
+    // 在状态栏下方绘制最近 THINKING_VISIBLE_COUNT 步思考历史
+    ThinkingStepCache* history = data.thinkingHistory;
+    if (!history || history->isEmpty()) return;
+
+    // 历史展示区域：状态栏下方，全宽横条
+    const int histX = 0;
+    const int histY = y + h + 2;           // 紧贴状态栏下方
+    const int histW = SCREEN_WIDTH;
+    const int lineH = 9;                   // 每行高度
+    const int maxVisible = THINKING_VISIBLE_COUNT;
+    const int histH = maxVisible * lineH;
+
+    // 半透明背景
+    _sprite.fillRect(histX, histY, histW, histH, COLOR_PANEL);
+
+    // 滚动动画：CIE easing (ease-in-out cubic)
+    float scrollFraction = 0.0f;
+    if (data.needsScroll) {
+        unsigned long elapsed = millis() - data.scrollStartTime;
+        float t = (float)elapsed / SCROLL_DURATION_MS;
+        if (t >= 1.0f) {
+            t = 1.0f;
+            // 注意：needsScroll在非const场景下可清除，这里仅读取
+            // 清除逻辑在update()中处理
+        }
+        // CIE ease-in-out: 3t^2 - 2t^3 (smoothstep)
+        scrollFraction = t * t * (3.0f - 2.0f * t);
+    }
+
+    // 获取最近 maxVisible+1 步（多取1步用于滚动过渡）
+    const ThinkingStep* steps[THINKING_VISIBLE_COUNT + 1];
+    uint8_t got = history->getRecentSteps(steps, maxVisible + 1);
+
+    // 绘制：索引0=最新，索引got-1=最旧
+    // 滚动时旧步骤向上滑出，新步骤从下方滑入
+    int scrollPixels = (int)(scrollFraction * lineH);
+    for (int i = 0; i < got && i < maxVisible + 1; i++) {
+        int drawIdx = i;  // 0=最新在最下面
+        int baseY = histY + histH - (drawIdx + 1) * lineH;
+        int yPos = baseY - scrollPixels;  // 滚动偏移
+
+        // 裁剪：只绘制可见区域
+        if (yPos + lineH <= histY || yPos >= histY + histH) continue;
+
+        // 最新步骤高亮，旧步骤渐暗
+        uint16_t textColor;
+        if (i == 0) {
+            textColor = 0xFFFF;  // 白色=最新
+        } else if (i == 1) {
+            textColor = 0xC618;  // 浅灰
+        } else {
+            textColor = 0x8410;  // 深灰=最旧
+        }
+
+        _sprite.setTextSize(1);
+        _sprite.setTextColor(textColor);
+        _sprite.setCursor(histX + 2, yPos);
+        // 截断显示：屏幕宽度约30字符
+        char display[32];
+        snprintf(display, sizeof(display), "%.28s", steps[i]->text);
+        _sprite.print(display);
+    }
+}
+
+// ============ [OPT-1] ThinkingStepCache PSRAM实现 ============
+
+ThinkingNode* ThinkingStepCache::_allocateNode() {
+    ThinkingNode* node = (ThinkingNode*)ps_malloc(sizeof(ThinkingNode));
+    if (!node) {
+        LOG_E("PSRAM alloc failed for ThinkingNode");
+        return nullptr;
+    }
+    memset(node, 0, sizeof(ThinkingNode));
+    return node;
+}
+
+void ThinkingStepCache::_freeNode(ThinkingNode* node) {
+    if (node) free(node);  // ps_malloc分配的内存用free释放
+}
+
+void ThinkingStepCache::_evictOldest() {
+    if (!_head) return;
+    ThinkingNode* old = _head;
+    _head = _head->next;
+    if (!_head) _tail = nullptr;  // 链表已空
+    _freeNode(old);
+    _count--;
+}
+
+void ThinkingStepCache::addStep(const char* text) {
+    if (!text || text[0] == '\0') return;
+
+    // 分配新节点
+    ThinkingNode* node = _allocateNode();
+    if (!node) return;  // PSRAM不足，跳过
+
+    // 填充数据
+    node->step.timestamp = millis();
+    strncpy(node->step.text, text, THINKING_STEP_TEXT_MAX - 1);
+    node->step.text[THINKING_STEP_TEXT_MAX - 1] = '\0';
+    node->next = nullptr;
+
+    // 追加到尾部
+    if (_tail) {
+        _tail->next = node;
+    } else {
+        _head = node;  // 链表为空，新节点即头节点
+    }
+    _tail = node;
+    _count++;
+
+    // 淘汰超出上限的最旧节点
+    while (_count > THINKING_HISTORY_MAX) {
+        _evictOldest();
+    }
+
+    _hasNew = true;
+}
+
+uint8_t ThinkingStepCache::getRecentSteps(const ThinkingStep** outSteps, uint8_t maxCount) const {
+    // 获取最近maxCount步，outSteps[0]=最新, outSteps[n-1]=最旧
+    // 需要从尾部向前遍历，但单链表只能从头遍历
+    // 策略：计算总步数，跳过前面的旧节点
+
+    if (!_head || maxCount == 0) return 0;
+
+    // 计算要跳过的步数
+    uint8_t skip = (_count > maxCount) ? (_count - maxCount) : 0;
+    uint8_t collected = 0;
+
+    ThinkingNode* cur = _head;
+    uint8_t idx = 0;
+
+    // 先遍历到第skip个节点
+    while (cur && idx < skip) {
+        cur = cur->next;
+        idx++;
+    }
+
+    // 临时数组收集（从旧到新），然后反转
+    const ThinkingStep* temp[THINKING_VISIBLE_COUNT + 2];  // 最多maxCount+1
+    uint8_t tempCount = 0;
+    while (cur && tempCount < maxCount) {
+        temp[tempCount++] = &cur->step;
+        cur = cur->next;
+    }
+
+    // 反转：outSteps[0]=最新
+    for (uint8_t i = 0; i < tempCount; i++) {
+        outSteps[i] = temp[tempCount - 1 - i];
+    }
+
+    return tempCount;
 }
 
 

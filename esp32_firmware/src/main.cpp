@@ -20,6 +20,7 @@
 #include "touch_handler.h"
 #include <esp_ota_ops.h>
 #include <esp_sleep.h>
+#include <esp_wifi.h>
 #include "driver/rtc_io.h"
 #include "ambient_light.h"
 #include "haptic_driver.h"
@@ -231,6 +232,7 @@ void renderTask(void* pvParameters) {
             // 数据到达 → 唤醒屏幕 + 恢复全速CPU + WiFi活跃
             setCpuFrequencyMhz(240);
             WiFi.setSleep(false);
+            esp_wifi_set_ps(WIFI_PS_NONE);  // 唤醒后关闭WiFi省电，最低延迟
             display.wakeup();
             g_screenDimmed = false;
             g_screenSleeping = false;
@@ -239,6 +241,8 @@ void renderTask(void* pvParameters) {
             // 超时 → 进入休眠 + 降频CPU + WiFi节能
             setCpuFrequencyMhz(80);
             WiFi.setSleep(true);
+            esp_wifi_set_ps(WIFI_PS_MAX_MODEM);  // WiFi射频仅在DTIM beacon时唤醒，~50%省电
+            esp_wifi_set_listen_interval(3);     // 每3个DTIM beacon唤醒一次，进一步降低WiFi功耗
             display.sleep();
             g_screenSleeping = true;
             g_screenDimmed = true;
@@ -271,10 +275,12 @@ void renderTask(void* pvParameters) {
                 gpio_hold_dis((gpio_num_t)BUZZER_PIN);
                 gpio_hold_dis((gpio_num_t)LCD_CS);
                 setCpuFrequencyMhz(240);
+                WiFi.setSleep(false);
+                esp_wifi_set_ps(WIFI_PS_NONE);  // Light Sleep唤醒后恢复WiFi全速
                 g_screenSleeping = false;
                 g_screenDimmed = false;
                 g_forceWake.store(true, std::memory_order_release);
-                LOG_I("Woke from Light Sleep, CPU 240MHz");
+                LOG_I("Woke from Light Sleep, CPU 240MHz, WiFi active");
             }
             vTaskDelay(pdMS_TO_TICKS(500));  // 未达Light Sleep阈值时低频轮询
             continue;
@@ -479,6 +485,11 @@ void setup() {
     
     // [Step 5] 双缓冲模式，无需互斥锁
     LOG_I("Double-buffer mode (no mutex needed)");
+    
+    // [OPT-1] 初始化思考历史缓存（PSRAM分配）
+    g_displayBuf[0].thinkingHistory = new ThinkingStepCache();
+    g_displayBuf[1].thinkingHistory = new ThinkingStepCache();
+    LOG_I("ThinkingStepCache initialized (2 buffers, max %d steps each)\n", THINKING_HISTORY_MAX);
     
     // 初始化显示
     LOG_I("初始化显示...");
@@ -884,9 +895,16 @@ void parseServerData(String json) {
             int backIdx = 1 - front;
             g_displayBuf[backIdx] = g_displayBuf[front];
             g_displayBuf[backIdx].agent.thinkingState = ts;
+
+            // [OPT-1] 记录思考步骤到历史缓存
+            String stepText = data["name"] | data["tool"] | state;
+            if (g_displayBuf[backIdx].thinkingHistory) {
+                g_displayBuf[backIdx].thinkingHistory->addStep(stepText.c_str());
+            }
+
             g_frontIdx.store(backIdx, std::memory_order_release);
         }
-        
+
         String toolStr = data["tool"] | "";
         LOG_I("state=%s tool=%s step=%d\n", state.c_str(), toolStr.c_str(), data["step_count"] | 0);
     }

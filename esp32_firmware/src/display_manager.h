@@ -13,6 +13,55 @@
 #include "pixel_player.h"
 #include "spring_animation.h"
 
+// ============ PSRAM 思考链历史缓冲 ============
+
+// 单步思考记录
+struct ThinkingStep {
+    unsigned long timestamp;           // millis() 时间戳
+    char text[THINKING_STEP_TEXT_MAX]; // 截断后的步骤文本
+};
+
+// PSRAM 静态链表节点
+struct ThinkingNode {
+    ThinkingStep step;
+    ThinkingNode* next;
+    ThinkingNode* prev;
+};
+
+// 基于PSRAM静态链表的环形缓冲（40步历史，滑动窗口5步可见）
+class ThinkingStepCache {
+public:
+    ThinkingStepCache();
+    ~ThinkingStepCache();
+
+    // 追加新步骤（自动淘汰最旧节点）
+    void addStep(const String& stepText);
+
+    // 获取最近 N 个步骤（N=VISIBLE_COUNT）
+    // 返回值: 实际可用步数, steps数组填充从旧到新的顺序
+    uint8_t getVisibleSteps(ThinkingStep steps[], uint8_t maxCount) const;
+
+    // 当前总步数
+    uint8_t count() const { return _count; }
+
+    // 检查是否有新步骤（自上次检查后）
+    bool hasNewStep() const { return _hasNew; }
+    void clearNewFlag() { _hasNew = false; }
+
+private:
+    ThinkingNode* _head;       // 最旧节点
+    ThinkingNode* _tail;       // 最新节点
+    uint8_t _count;            // 当前节点数
+    bool _hasNew;              // 新步骤标志
+
+    // 从PSRAM分配节点
+    ThinkingNode* _allocateNode();
+    // 释放节点回PSRAM
+    void _freeNode(ThinkingNode* node);
+    // 淘汰最旧节点
+    void _evictOldest();
+};
+
 // ============ 屏幕驱动配置 ============
 
 class LGFX : public lgfx::LGFX_Device {
@@ -200,7 +249,7 @@ private:
     void drawIconCloudMoon(int x, int y);
 
     // 思考链指示器
-    void drawThinkingIndicator(ThinkingState state, uint8_t stepCount);
+    void drawThinkingIndicator(const DisplayData& data);
 
     // 辅助绘制
     void drawEyes(int x, int y, int size, uint16_t color, bool blink);

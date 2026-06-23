@@ -54,11 +54,19 @@ bool PixelPlayer::validateHeader(const uint8_t* data, size_t len) const {
         return false;
     }
 
-    // 总数据长度检查
-    size_t expected = PXL_HEADER_SIZE + (size_t)hdr->frame_count * hdr->width * hdr->height * 2;
-    if (len < expected) {
-        LOG_I("Data too small: got %u, need %u\n", len, expected);
-        return false;
+    // 总数据长度检查（差分帧文件实际大小远小于frame_count*w*h*2，仅检查至少有完整第一帧）
+    if (hdr->flags & PXL_FLAG_DELTA) {
+        size_t minExpected = PXL_HEADER_SIZE + (size_t)hdr->width * hdr->height * 2;
+        if (len < minExpected) {
+            LOG_E("Delta file too small: got %u, need at least %u\n", len, minExpected);
+            return false;
+        }
+    } else {
+        size_t expected = PXL_HEADER_SIZE + (size_t)hdr->frame_count * hdr->width * hdr->height * 2;
+        if (len < expected) {
+            LOG_I("Data too small: got %u, need %u\n", len, expected);
+            return false;
+        }
     }
 
     return true;
@@ -123,12 +131,61 @@ bool PixelPlayer::allocPSRAMPBuffer(size_t totalSize) {
     return true;
 }
 
-// 加载帧数据：RLE压缩则逐帧解压，否则直接memcpy
+// 加载帧数据：RLE压缩则逐帧解压，差分帧则逐帧重建，否则直接memcpy
 bool PixelPlayer::loadFrameData(const uint8_t* data, size_t len) {
     size_t totalSize = (size_t)_header.frame_count * (size_t)_header.width * (size_t)_header.height * 2;
+    size_t pixelsPerFrame = (size_t)_header.width * _header.height;
 
-    if (_header.flags & PXL_FLAG_RLE) {
-        size_t pixelsPerFrame = (size_t)_header.width * _header.height;
+    if (_header.flags & PXL_FLAG_DELTA) {
+        // 差分帧编码：第0帧完整，后续帧为差分
+        const uint8_t* src = data + PXL_HEADER_SIZE;
+        size_t remaining = len - PXL_HEADER_SIZE;
+
+        // 第0帧：直接拷贝完整帧
+        if (remaining < pixelsPerFrame * 2) {
+            LOG_E("Delta: not enough data for frame 0\n");
+            free(_frameBuffer); _frameBuffer = nullptr;
+            return false;
+        }
+        memcpy(_frameBuffer, src, pixelsPerFrame * 2);
+        src += pixelsPerFrame * 2;
+        remaining -= pixelsPerFrame * 2;
+
+        // 后续帧：差分解压
+        for (uint16_t f = 1; f < _header.frame_count; f++) {
+            uint16_t* prev = _frameBuffer + (f - 1) * pixelsPerFrame;
+            uint16_t* dst = _frameBuffer + f * pixelsPerFrame;
+            // 复制前一帧作为基础（delta仅覆盖变化像素）
+            memcpy(dst, prev, pixelsPerFrame * 2);
+
+            if (!deltaDecompress(src, remaining, prev, dst, pixelsPerFrame)) {
+                LOG_E("Delta decompress failed at frame %d\n", f);
+                free(_frameBuffer); _frameBuffer = nullptr;
+                return false;
+            }
+            // 扫描delta数据消耗量
+            size_t consumed = 0;
+            size_t decoded = 0;
+            while (decoded < pixelsPerFrame && consumed < remaining) {
+                uint8_t opcode = src[consumed++];
+                if (opcode == 0x00) {       // COPY
+                    uint8_t n = src[consumed++];
+                    decoded += n;
+                } else if (opcode == 0x01) { // REPEAT
+                    uint8_t n = src[consumed++];
+                    consumed += 2;
+                    decoded += n;
+                } else {                     // LITERAL (opcode == count)
+                    consumed += opcode * 2;
+                    decoded += opcode;
+                }
+            }
+            src += consumed;
+            remaining -= consumed;
+        }
+        LOG_I("Delta decompressed %d frames OK\n", _header.frame_count);
+
+    } else if (_header.flags & PXL_FLAG_RLE) {
         const uint8_t* src = data + PXL_HEADER_SIZE;
         size_t remaining = len - PXL_HEADER_SIZE;
 
@@ -136,11 +193,9 @@ bool PixelPlayer::loadFrameData(const uint8_t* data, size_t len) {
             uint16_t* dst = _frameBuffer + f * pixelsPerFrame;
             if (!rleDecompress(src, remaining, dst, pixelsPerFrame)) {
                 LOG_E("RLE decompress failed at frame %d\n", f);
-                free(_frameBuffer);
-                _frameBuffer = nullptr;
+                free(_frameBuffer); _frameBuffer = nullptr;
                 return false;
             }
-            // 前进src：扫描压缩数据实际消耗的字节数
             size_t consumed = 0;
             size_t decoded = 0;
             while (decoded < pixelsPerFrame && consumed < remaining) {
@@ -159,6 +214,43 @@ bool PixelPlayer::loadFrameData(const uint8_t* data, size_t len) {
         LOG_I("RLE decompressed %d frames OK\n", _header.frame_count);
     } else {
         memcpy(_frameBuffer, data + PXL_HEADER_SIZE, totalSize);
+    }
+    return true;
+}
+
+// Delta帧解压：将差分数据应用到output（基于prev重建curr）
+bool PixelPlayer::deltaDecompress(const uint8_t* deltaData, size_t deltaLen,
+                                   const uint16_t* prevFrame, uint16_t* output, size_t pixelCount) {
+    size_t di = 0;   // delta数据索引
+    size_t pi = 0;   // 像素索引
+
+    while (pi < pixelCount && di < deltaLen) {
+        uint8_t opcode = deltaData[di++];
+
+        if (opcode == 0x00) {
+            // COPY：N个像素未变，跳过（output已有前一帧数据）
+            if (di >= deltaLen) break;
+            uint8_t n = deltaData[di++];
+            pi += n;
+        } else if (opcode == 0x01) {
+            // REPEAT：N个连续像素变化为同一新值
+            if (di + 2 >= deltaLen) break;
+            uint8_t n = deltaData[di++];
+            uint16_t newPixel = deltaData[di] | (deltaData[di + 1] << 8);
+            di += 2;
+            for (uint8_t j = 0; j < n && pi < pixelCount; j++) {
+                output[pi++] = newPixel;
+            }
+        } else {
+            // LITERAL：opcode即为像素个数，后跟opcode个新像素值
+            uint8_t n = opcode;
+            if (di + n * 2 > deltaLen) break;
+            for (uint8_t j = 0; j < n && pi < pixelCount; j++) {
+                output[pi] = deltaData[di] | (deltaData[di + 1] << 8);
+                di += 2;
+                pi++;
+            }
+        }
     }
     return true;
 }

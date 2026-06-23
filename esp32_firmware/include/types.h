@@ -50,6 +50,12 @@ struct DisplayData {
     WeatherInfo weather;
     uint32_t lastUpdate;
     bool connected;
+
+    // 思考链历史滚动展示 (PSRAM环形缓冲)
+    ThinkingStepCache* thinkingHistory = nullptr;  // 在setup()中分配到PSRAM
+    float scrollOffset = 0.0f;                     // 当前滚动偏移 (0.0~1.0)
+    bool needsScroll = false;                      // 是否需要滚动动画
+    unsigned long scrollStartTime = 0;             // 滚动动画开始时间
 };
 
 #endif // TYPES_H

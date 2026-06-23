@@ -22,6 +22,93 @@ from modules.communication import create_communication, DeviceMessage
 from modules.otlp_receiver import OTLPReceiver
 from tray_app import TrayApp
 
+class ThreadHealthGuard:
+    """线程健康守护器：通过心跳监控线程存活状态，异常时自动重启"""
+    
+    def __init__(self, check_interval: float = 30.0, heartbeat_timeout: float = 60.0):
+        self._check_interval = check_interval
+        self._heartbeat_timeout = heartbeat_timeout
+        self._heartbeats: Dict[str, float] = {}       # name → last_beat_time
+        self._thread_factories: Dict[str, Callable] = {}  # name → factory_func
+        self._threads: Dict[str, threading.Thread] = {}
+        self._running = False
+        self._guard_thread: Optional[threading.Thread] = None
+    
+    def register(self, name: str, thread_factory: Callable, initial_thread: Optional[threading.Thread] = None):
+        """注册受监控线程：name=标识, factory=重建函数, initial=当前已有线程"""
+        self._heartbeats[name] = time.time()
+        self._thread_factories[name] = thread_factory
+        if initial_thread:
+            self._threads[name] = initial_thread
+    
+    def heartbeat(self, name: str):
+        """被监控线程调用，更新心跳时间戳"""
+        self._heartbeats[name] = time.time()
+    
+    def start(self):
+        """启动守护线程"""
+        self._running = True
+        self._guard_thread = threading.Thread(target=self._guard_loop, daemon=True, name="health_guard")
+        self._guard_thread.start()
+        logger.info("ThreadHealthGuard 已启动")
+    
+    def stop(self):
+        self._running = False
+    
+    def _guard_loop(self):
+        while self._running:
+            time.sleep(self._check_interval)
+            now = time.time()
+            for name in list(self._heartbeats.keys()):
+                elapsed = now - self._heartbeats[name]
+                thread = self._threads.get(name)
+                
+                # 检查线程是否已死亡
+                if thread and not thread.is_alive():
+                    logger.error(f"[HealthGuard] 线程 '{name}' 已死亡，尝试重启...")
+                    self._restart_thread(name)
+                    continue
+                
+                # 检查心跳是否超时
+                if elapsed > self._heartbeat_timeout:
+                    logger.warning(f"[HealthGuard] 线程 '{name}' 心跳超时 ({elapsed:.0f}s > {self._heartbeat_timeout:.0f}s)")
+                    # [FIX-BUG2] 移除冗余is_alive检查——线程alive但心跳超时=卡死，直接重启
+                    self._restart_thread(name)
+    
+    def _restart_thread(self, name: str):
+        """重建并启动线程"""
+        factory = self._thread_factories.get(name)
+        if not factory:
+            logger.error(f"[HealthGuard] 线程 '{name}' 无重建工厂，跳过")
+            return
+        try:
+            # [FIX-BUG3] 尝试终止旧线程，避免并发执行
+            old_thread = self._threads.get(name)
+            if old_thread and old_thread.is_alive():
+                import ctypes
+                tid = old_thread.ident
+                if tid:
+                    try:
+                        ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                            ctypes.c_ulong(tid), ctypes.py_object(SystemExit))
+                        old_thread.join(timeout=2.0)
+                        if old_thread.is_alive():
+                            logger.warning(f"[HealthGuard] 旧线程 '{name}' 未能在2s内退出")
+                        else:
+                            logger.info(f"[HealthGuard] 旧线程 '{name}' 已成功终止")
+                    except Exception as e:
+                        logger.warning(f"[HealthGuard] 终止旧线程 '{name}' 异常: {e}")
+
+            new_thread = factory()
+            if new_thread:
+                self._threads[name] = new_thread
+                new_thread.start()  # [FIX-BUG1] 启动新线程
+                self._heartbeats[name] = time.time()
+                logger.info(f"[HealthGuard] 线程 '{name}' 已重启")
+        except Exception as e:
+            logger.error(f"[HealthGuard] 重启线程 '{name}' 失败: {e}")
+
+
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
@@ -77,6 +164,9 @@ class DesktopPetMonitor:
         # 定时器记录
         self._last_token_update = 0.0
         self._last_weather_update = 0.0
+        
+        # 线程健康守护
+        self._health_guard = ThreadHealthGuard()
         self._tray_app = None  # 托盘应用引用
         
     def _load_config(self, config_path: str) -> Dict[str, Any]:
@@ -254,6 +344,7 @@ class DesktopPetMonitor:
                 self._last_weather_update = now
                 self._send_weather_update()
             
+            self._health_guard.heartbeat("periodic_update")
             time.sleep(update_interval)
     
     def start(self) -> bool:
@@ -280,6 +371,12 @@ class DesktopPetMonitor:
         update_thread = threading.Thread(target=self._periodic_update, daemon=True)
         update_thread.start()
         
+        # 注册线程健康监控
+        self._health_guard.register("periodic_update", 
+            lambda: threading.Thread(target=self._periodic_update, daemon=True),
+            initial_thread=update_thread)
+        self._health_guard.start()
+        
         logger.info("监控程序已启动，等待设备请求...")
         
         # 主循环
@@ -297,6 +394,7 @@ class DesktopPetMonitor:
         """停止监控程序"""
         logger.info("正在停止监控程序...")
         self.running = False
+        self._health_guard.stop()
         self._otlp_receiver.stop()
         self.communication.disconnect()
         logger.info("监控程序已停止")
@@ -405,6 +503,13 @@ def main() -> None:
 
         update_thread = threading.Thread(target=monitor._periodic_update, daemon=True)
         update_thread.start()
+        
+        # 注册线程健康监控
+        monitor._health_guard.register("periodic_update",
+            lambda: threading.Thread(target=monitor._periodic_update, daemon=True),
+            initial_thread=update_thread)
+        monitor._health_guard.start()
+        
         logger.info("监控+托盘GUI已启动")
 
         app.run()  # 主线程tkinter事件循环

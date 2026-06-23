@@ -97,4 +97,27 @@
 #define HAPTIC_SDA_PIN          41      // 与BH1750共享I2C总线
 #define HAPTIC_SCL_PIN          42
 
+// ============ 思考链历史展示配置 ============
+#define THINKING_HISTORY_MAX      40    // PSRAM环形缓冲最大步数
+#define THINKING_VISIBLE_COUNT    5     // 同时可见的最近步骤数
+#define SCROLL_DURATION_MS        800   // 滚动动画时长(ms)
+#define THINKING_STEP_TEXT_MAX    64    // 单步文本最大长度
+
+// ============ .pxl 差分帧协议 ============
+#define DELTA_FULL                0x01  // 完整帧标记
+#define DELTA_DIFF                0x02  // 差分帧标记
+#define RLE_COPY                  0x00  // 复制操作
+#define RLE_REPEAT                0x01  // 重复操作
+#define RLE_LITERAL               0x02  // 字面操作
+#define RLE_MAX_RUN               127   // RLE最大游程
+#define LITERAL_MAX_LEN           127   // 字面最大长度
+
+// ============ WiFi省电配置 ============
+#define IDLE_POWER_MODE           2     // 空闲省电模式(0=ACTIVE,1=MODEM_SLEEP_AUTO,2=LIGHT_SLEEP)
+#define DTIM_ACTIVE               1     // 活跃态DTIM间隔
+#define DTIM_IDLE                 10    // 空闲态DTIM间隔
+#define IDLE_TIMEOUT_MS           30000 // 进入省电模式的空闲超时(ms)
+#define WAKE_CHECK_INTERVAL_MS    500   // 唤醒检查间隔(ms)
+#define BSS_MAX_IDLE_SEC          300   // BSS最大空闲时间(秒)
+
 #endif // CONFIG_H

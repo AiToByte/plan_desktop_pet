@@ -3,6 +3,7 @@ PXL 像素编码器
 将图片/GIF 转换为 .pxl 二进制像素文件
 """
 import struct
+import array
 import numpy as np
 from pathlib import Path
 from PIL import Image
@@ -10,6 +11,7 @@ from PIL import Image
 PXL_MAGIC = b'PXL'
 PXL_VERSION = 1
 PXL_FLAG_RLE = 0x0002  # flags bit1: RLE压缩
+PXL_FLAG_DELTA = 0x0004  # flags bit2: 差分帧编码（与RLE互斥）
 DEFAULT_SIZE = (32, 32)
 DEFAULT_INTERVAL = 200  # ms
 
@@ -85,6 +87,129 @@ def rle_compress(rgb565_data: bytes) -> bytes:
     return bytes(result)
 
 
+# ── 差分帧压缩器（Delta Encoding）──
+DELTA_COPY    = 0x00   # 像素未变，跳过
+DELTA_REPEAT  = 0x01   # N个连续变化像素(同一新值)
+DELTA_LITERAL = 0x02   # N个像素(各自新值)
+LITERAL_MAX   = 127
+REPEAT_MAX    = 127
+
+
+class DeltaCompressor:
+    """PXL帧间差分编码器：仅编码变化像素，降低传输量60-90%"""
+
+    @staticmethod
+    def encode(prev_rgb565: bytes, curr_rgb565: bytes) -> bytes:
+        """生成差分帧：prev→curr的变化像素编码
+        返回: delta opcodes (不含帧头)
+        """
+        pixel_count = len(curr_rgb565) // 2
+        if pixel_count == 0 or len(prev_rgb565) != len(curr_rgb565):
+            return curr_rgb565
+
+        prev_arr = array.array('H')
+        prev_arr.frombytes(prev_rgb565)
+
+        curr_arr = array.array('H')
+        curr_arr.frombytes(curr_rgb565)
+
+        diff = []   # (is_changed, new_pixel) tuples
+        for i in range(pixel_count):
+            diff.append((prev_arr[i] != curr_arr[i], curr_arr[i]))
+
+        return DeltaCompressor._compress(diff, pixel_count)
+
+    @staticmethod
+    def _compress(diff, pixel_count):
+        """将diff列表编码为delta opcodes"""
+        out = bytearray()
+        i = 0
+        while i < pixel_count:
+            is_changed, px = diff[i]
+
+            if not is_changed:
+                # COPY run: 连续不变像素
+                run = 1
+                while i + run < pixel_count and not diff[i + run][0]:
+                    run += 1
+                # 写COPY opcode让decoder正确跳过不变像素
+                copy_left = run
+                while copy_left > 0:
+                    chunk = min(copy_left, 255)
+                    out.append(DELTA_COPY)
+                    out.append(chunk)
+                    copy_left -= chunk
+                i += run
+                continue
+
+            # 变化像素：检查是否连续相同值(REPEAT)
+            if i + 1 < pixel_count and diff[i + 1][0] and diff[i + 1][1] == px:
+                run = 2
+                while i + run < pixel_count and diff[i + run][0] and diff[i + run][1] == px and run < REPEAT_MAX:
+                    run += 1
+                out.append(DELTA_REPEAT)
+                out.append(run)
+                out.extend(struct.pack('<H', px))
+                i += run
+            else:
+                # LITERAL run: 不同变化像素
+                run = 1
+                while i + run < pixel_count and run < LITERAL_MAX:
+                    next_changed, next_px = diff[i + run]
+                    if not next_changed:
+                        break
+                    # 如果接下来3个像素相同值，用REPEAT更优
+                    if i + run + 2 < pixel_count:
+                        if (diff[i + run + 1][0] and diff[i + run + 1][1] == next_px and
+                            diff[i + run + 2][0] and diff[i + run + 2][1] == next_px):
+                            break
+                    run += 1
+                # LITERAL: opcode直接是像素个数（匹配ESP32 deltaDecompress协议）
+                out.append(run)
+                for j in range(i, i + run):
+                    out.extend(struct.pack('<H', diff[j][1]))
+                i += run
+
+        return bytes(out)
+
+    @staticmethod
+    def decode(prev_rgb565: bytes, delta_data: bytes, pixel_count: int) -> bytes:
+        """从差分帧还原完整帧：prev + delta → curr"""
+        result = bytearray(prev_rgb565)
+        di = 0  # delta_data index
+        pi = 0  # pixel index
+
+        while di < len(delta_data) and pi < pixel_count:
+            opcode = delta_data[di]
+            di += 1
+
+            if opcode == DELTA_COPY:
+                run = delta_data[di] if di < len(delta_data) else 0
+                di += 1
+                pi += run   # 跳过（已从prev复制）
+            elif opcode == DELTA_REPEAT:
+                run = delta_data[di] if di < len(delta_data) else 0
+                di += 1
+                if di + 1 < len(delta_data):
+                    lo, hi = delta_data[di], delta_data[di + 1]
+                    di += 2
+                    for _ in range(run):
+                        if pi < pixel_count:
+                            result[pi * 2] = lo
+                            result[pi * 2 + 1] = hi
+                            pi += 1
+            else:
+                # LITERAL: opcode直接是像素个数（匹配ESP32 deltaDecompress协议）
+                run = opcode
+                for _ in range(run):
+                    if di + 1 < len(delta_data) and pi < pixel_count:
+                        result[pi * 2] = delta_data[di]
+                        result[pi * 2 + 1] = delta_data[di + 1]
+                        di += 2
+                        pi += 1
+        return bytes(result)
+
+
 def create_pxl_header(width: int, height: int, frame_count: int,
                       frame_interval: int = DEFAULT_INTERVAL, flags: int = 1) -> bytes:
     """创建PXL文件头（16字节）"""
@@ -153,10 +278,16 @@ def gif_to_pxl(gif_path: str, output_path: str = None, size: tuple = DEFAULT_SIZ
     except (KeyError, AttributeError):
         interval = DEFAULT_INTERVAL
 
-    header = create_pxl_header(size[0], size[1], len(frames), interval, flags=1 if loop else 0)
+    header = create_pxl_header(size[0], size[1], len(frames), interval, flags=(1 if loop else 0) | PXL_FLAG_DELTA)
     pixel_frames = []
+    prev_rgb565 = None
     for i, f in enumerate(frames):
-        pixel_frames.append(image_to_rgb565_data(f))
+        rgb565 = image_to_rgb565_data(f)
+        if prev_rgb565 is None:
+            pixel_frames.append(rgb565)  # 第一帧：完整帧
+        else:
+            pixel_frames.append(DeltaCompressor.encode(prev_rgb565, rgb565))  # 后续帧：差分
+        prev_rgb565 = rgb565
         if progress_cb:
             progress_cb(i + 1, len(frames))
     pixel_data = b''.join(pixel_frames)
@@ -195,10 +326,16 @@ def png_to_pxl_frames(png_path: str, output_path: str = None, size: tuple = DEFA
         frame = img.crop(box).resize(size, Image.LANCZOS)
         frames.append(frame)
 
-    header = create_pxl_header(size[0], size[1], len(frames), interval, flags=1)
+    header = create_pxl_header(size[0], size[1], len(frames), interval, flags=PXL_FLAG_DELTA)
     pixel_frames = []
+    prev_rgb565 = None
     for i, f in enumerate(frames):
-        pixel_frames.append(image_to_rgb565_data(f))
+        rgb565 = image_to_rgb565_data(f)
+        if prev_rgb565 is None:
+            pixel_frames.append(rgb565)  # 第一帧：完整帧
+        else:
+            pixel_frames.append(DeltaCompressor.encode(prev_rgb565, rgb565))  # 后续帧：差分
+        prev_rgb565 = rgb565
         if progress_cb:
             progress_cb(i + 1, len(frames))
     pixel_data = b''.join(pixel_frames)
