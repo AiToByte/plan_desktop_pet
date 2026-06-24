@@ -170,11 +170,16 @@ class AgentMonitor:
             if not os.path.isdir(expanded_dir):
                 continue
             
-            # 找到最新的JSONL文件
-            jsonl_files: List[str] = glob.glob(
-                os.path.join(expanded_dir, "**", "*.jsonl"), 
-                recursive=True
-            )
+            # 找到最新的JSONL文件（限制搜索深度≤3层，避免home目录递归过深）
+            from pathlib import Path
+            base_path = Path(expanded_dir)
+            jsonl_files: List[str] = [
+                str(p) for p in base_path.glob("*/*/*/*.jsonl")
+            ] or [
+                str(p) for p in base_path.glob("*/*.jsonl")
+            ] or [
+                str(p) for p in base_path.glob("*.jsonl")
+            ]
             if not jsonl_files:
                 continue
             

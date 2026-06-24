@@ -535,6 +535,10 @@ class WiFiCommunication(CommunicationBase):
                     break
                 
                 buffer += data
+                # [FIX-BUF] 防止畸形数据导致buffer无限增长
+                if len(buffer) > 512 * 1024:  # 512KB上限
+                    logger.warning(f"接收缓冲区溢出({len(buffer)}B)，清空")
+                    buffer = ""
                 
                 while buffer:
                     if expected_len is not None:

@@ -82,7 +82,7 @@ def rle_compress(rgb565_data: bytes) -> bytes:
             if lit_count > 0:
                 result.append(lit_count)
                 for i in range(lit_count):
-                    result.extend(struct.pack('<H', struct.unpack_from('<H', rgb565_data, (lit_start + i) * 2)[0]))
+                    result.extend(struct.pack('>H', struct.unpack_from('<H', rgb565_data, (lit_start + i) * 2)[0]))
 
     return bytes(result)
 
@@ -165,9 +165,15 @@ class DeltaCompressor:
                             break
                     run += 1
                 # LITERAL: opcode直接是像素个数（匹配ESP32 deltaDecompress协议）
-                out.append(run)
-                for j in range(i, i + run):
-                    out.extend(struct.pack('<H', diff[j][1]))
+                # 注意：opcode 0x01 是 REPEAT，所以单像素LITERAL需特殊处理
+                if run == 1:
+                    out.append(DELTA_REPEAT)
+                    out.append(1)
+                    out.extend(struct.pack('<H', diff[i][1]))
+                else:
+                    out.append(run)
+                    for j in range(i, i + run):
+                        out.extend(struct.pack('<H', diff[j][1]))
                 i += run
 
         return bytes(out)

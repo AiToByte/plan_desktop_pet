@@ -76,28 +76,23 @@ class ThreadHealthGuard:
                     self._restart_thread(name)
     
     def _restart_thread(self, name: str):
-        """重建并启动线程"""
+        """重建并启动线程（不使用PyThreadState_SetAsyncExc，跨平台可靠）"""
         factory = self._thread_factories.get(name)
         if not factory:
             logger.error(f"[HealthGuard] 线程 '{name}' 无重建工厂，跳过")
             return
         try:
-            # [FIX-BUG3] 尝试终止旧线程，避免并发执行
+            # [FIX-BUG2] 等待旧线程自然退出，不强制注入异常（不可靠）
             old_thread = self._threads.get(name)
             if old_thread and old_thread.is_alive():
-                import ctypes
-                tid = old_thread.ident
-                if tid:
-                    try:
-                        ctypes.pythonapi.PyThreadState_SetAsyncExc(
-                            ctypes.c_ulong(tid), ctypes.py_object(SystemExit))
-                        old_thread.join(timeout=2.0)
-                        if old_thread.is_alive():
-                            logger.warning(f"[HealthGuard] 旧线程 '{name}' 未能在2s内退出")
-                        else:
-                            logger.info(f"[HealthGuard] 旧线程 '{name}' 已成功终止")
-                    except Exception as e:
-                        logger.warning(f"[HealthGuard] 终止旧线程 '{name}' 异常: {e}")
+                old_thread.join(timeout=3.0)
+                if old_thread.is_alive():
+                    logger.warning(
+                        f"[HealthGuard] 旧线程 '{name}' 未能在3s内退出，"
+                        f"新线程仍将启动（旧线程为daemon，不会阻止进程退出）"
+                    )
+                else:
+                    logger.info(f"[HealthGuard] 旧线程 '{name}' 已正常退出")
 
             new_thread = factory()
             if new_thread:

@@ -147,15 +147,26 @@ bool HapticDriver::calibrate() {
     _writeRegister(REG_GO, 0x01);
 
     // Step 7: 等待校准完成 (GO位自动清零)
+    // [FIX-BUG5] 使用_readRegisterSafe检测I2C失败，避免误判
     unsigned long start = millis();
     while (millis() - start < 1500) {  // 最多等1.5秒
-        uint8_t go = _readRegister(REG_GO);
+        uint8_t go;
+        if (!_readRegisterSafe(REG_GO, go)) {
+            LOG_W("I2C read failed during calibration wait\n");
+            _available = false;
+            return false;
+        }
         if ((go & 0x01) == 0) {
             // 校准完成，读取诊断结果
-            uint8_t diag = _readRegister(REG_STATUS);
+            uint8_t diag;
+            if (!_readRegisterSafe(REG_STATUS, diag)) {
+                LOG_W("I2C read failed reading calibration status\n");
+                _available = false;
+                return false;
+            }
             LOG_I("Calibration done. Status=0x%02X (0x00=OK)\n", diag);
-            _available = true;
-            return true;
+            _available = (diag == 0x00);  // 仅当状态为0时才认为成功
+            return _available;
         }
         delay(50);
     }
@@ -263,4 +274,16 @@ uint8_t HapticDriver::_readRegister(uint8_t reg) {
     _wire.endTransmission();
     _wire.requestFrom((uint8_t)DRV2605_ADDR, (uint8_t)1);
     return _wire.available() ? _wire.read() : 0;
+}
+
+// [FIX-BUG5] 安全版本：区分"读取到0"和"读取失败"
+bool HapticDriver::_readRegisterSafe(uint8_t reg, uint8_t& value) {
+    _wire.beginTransmission(DRV2605_ADDR);
+    _wire.write(reg);
+    if (_wire.endTransmission() != 0) return false;
+    _wire.requestFrom((uint8_t)DRV2605_ADDR, (uint8_t)1);
+    if (!_wire.available()) return false;
+    value = _wire.read();
+    return true;
+}
 }

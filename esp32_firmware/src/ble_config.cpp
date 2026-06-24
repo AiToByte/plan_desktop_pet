@@ -135,7 +135,6 @@ bool BleConfigManager::begin(const String& deviceName) {
     adv->addServiceUUID(CONFIG_SERVICE_UUID);
     adv->setScanResponse(true);
     adv->setMinPreferred(0x06);
-    adv->setMinPreferred(0x12);
     
     _initialized = true;
     LOG_I("Init OK");

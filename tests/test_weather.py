@@ -383,11 +383,10 @@ class TestParseWeatherEdgeCases(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_parse_main_not_dict(self):
-        """L212-214: main字段不是dict时抛出AttributeError(source未捕获此类型)"""
+        """L212-214: main字段不是dict时被except捕获，返回None"""
         data = {"name": "Test", "main": "invalid", "weather": [{}], "wind": {}}
-        # source只捕获ValueError/KeyError/IndexError/TypeError, AttributeError会穿透
-        with self.assertRaises(AttributeError):
-            self.service._parse_weather(data)
+        result = self.service._parse_weather(data)
+        self.assertIsNone(result)
 
 
 if __name__ == "__main__":

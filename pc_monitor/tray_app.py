@@ -85,6 +85,7 @@ class StatusPanel(tk.Toplevel):
         self._drag_data = {'x': 0, 'y': 0}
         self.bind('<Button-1>', self._on_drag_start)
         self.bind('<B1-Motion>', self._on_drag_motion)
+        self.bind('<ButtonRelease-1>', self._on_drag_end)
 
         # 定时刷新
         self._refresh_interval_ms = 2000
@@ -237,6 +238,36 @@ class StatusPanel(tk.Toplevel):
         dy = event.y - self._drag_data['y']
         x = self.winfo_x() + dx
         y = self.winfo_y() + dy
+        self.geometry(f"+{x}+{y}")
+
+    def _on_drag_end(self, event):
+        """[OPT-MAG] 拖拽释放：屏幕边缘磁吸检测"""
+        SNAP_THRESHOLD = 20  # 像素阈值
+        x = self.winfo_x()
+        y = self.winfo_y()
+        w = self.winfo_width()
+        h = self.winfo_height()
+        
+        # 获取当前显示器工作区边界
+        bounds = self._get_monitor_bounds(x + w // 2, y + h // 2)
+        if not bounds:
+            return  # 获取不到则跳过
+        mon_left, mon_top, mon_right, mon_bottom = bounds
+        
+        # 左边缘吸附
+        if abs(x - mon_left) < SNAP_THRESHOLD:
+            x = mon_left
+        # 右边缘吸附
+        elif abs((x + w) - mon_right) < SNAP_THRESHOLD:
+            x = mon_right - w
+        
+        # 上边缘吸附
+        if abs(y - mon_top) < SNAP_THRESHOLD:
+            y = mon_top
+        # 下边缘吸附
+        elif abs((y + h) - mon_bottom) < SNAP_THRESHOLD:
+            y = mon_bottom - h
+        
         self.geometry(f"+{x}+{y}")
 
 

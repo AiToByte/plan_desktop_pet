@@ -1289,24 +1289,27 @@ void DisplayManager::applyNightFilter() {
     _nightWarmth = _nightWarmth * 0.95f + targetWarmth * 0.05f;
     if (_nightWarmth < 0.01f) return;  // 暖色极低，跳过处理
 
-    // 像素级色温偏移：直接在sprite帧缓冲上逐像素应用色彩矩阵
+    // 像素级色温矩阵：直接在sprite帧缓冲上逐像素应用色温变换
     uint16_t* buf = (uint16_t*)_sprite.getBuffer();
     if (!buf) return;
     
     const int totalPixels = SCREEN_WIDTH * SCREEN_HEIGHT;
-    // 预计算偏移量（整数运算，避免浮点内循环）
-    const int redBoost   = (int)(_nightWarmth * 5.0f);    // 红通道+0~5/31
-    const int blueCut    = (int)(_nightWarmth * 12.0f);   // 蓝通道-0~12/31
+    // [OPT-NIGHT] 色温矩阵：参考2700K色温曲线，R微增/G略减/B大幅减
+    // 预计算整数因子 (Q8定点: 256=1.0)
+    const int rFactor = 256 + (int)(_nightWarmth * 20.0f);   // 1.00→1.08 (R微增)
+    const int gFactor = 256 - (int)(_nightWarmth * 30.0f);   // 1.00→0.88 (G略减)
+    const int bFactor = 256 - (int)(_nightWarmth * 100.0f);  // 1.00→0.61 (B大幅减)
     
     for (int i = 0; i < totalPixels; i++) {
         uint16_t c = buf[i];
-        // RGB565: RRRRRGGGGGGBBBBB
         int r = (c >> 11) & 0x1F;
         int g = (c >> 5)  & 0x3F;
         int b =  c        & 0x1F;
         
-        r = r + redBoost;   if (r > 31) r = 31;
-        b = b - blueCut;    if (b < 0)  b = 0;
+        // Q8定点乘法：(val * factor + 128) >> 8 ≈ val * (factor/256)
+        r = (r * rFactor + 128) >> 8;  if (r > 31) r = 31;
+        g = (g * gFactor + 128) >> 8;  if (g > 63) g = 63;  if (g < 0) g = 0;
+        b = (b * bFactor + 128) >> 8;  if (b < 0)  b = 0;
         
         buf[i] = (uint16_t)((r << 11) | (g << 5) | b);
     }
@@ -1319,8 +1322,14 @@ uint16_t DisplayManager::nightShiftColor(uint16_t color) const {
     int g = (color >> 5)  & 0x3F;
     int b =  color        & 0x1F;
     
-    r = r + (int)(_nightWarmth * 5.0f);   if (r > 31) r = 31;
-    b = b - (int)(_nightWarmth * 12.0f);  if (b < 0)  b = 0;
+    // [OPT-NIGHT] 与applyNightFilter使用相同的色温矩阵
+    const int rFactor = 256 + (int)(_nightWarmth * 20.0f);
+    const int gFactor = 256 - (int)(_nightWarmth * 30.0f);
+    const int bFactor = 256 - (int)(_nightWarmth * 100.0f);
+    
+    r = (r * rFactor + 128) >> 8;  if (r > 31) r = 31;
+    g = (g * gFactor + 128) >> 8;  if (g > 63) g = 63;  if (g < 0) g = 0;
+    b = (b * bFactor + 128) >> 8;  if (b < 0)  b = 0;
     
     return (uint16_t)((r << 11) | (g << 5) | b);
 }
@@ -1356,6 +1365,6 @@ void DisplayManager::waitForVSync(uint32_t timeout_ms) {
     unsigned long start = millis();
     while (!s_teTriggered) {
         if (millis() - start > timeout_ms) break;
-        delayMicroseconds(100);  // 100us轮询，避免busy-wait过热
+        vTaskDelay(pdMS_TO_TICKS(1));  // 1ms yield，释放CPU给其他FreeRTOS任务
     }
 }

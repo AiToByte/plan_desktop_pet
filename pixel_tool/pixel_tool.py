@@ -98,7 +98,17 @@ def cmd_info(args: Any) -> int:
 
     pixel_size = width * height * frame_count * 2
     file_size = len(data)
-    expected = 16 + pixel_size
+    expected = PXL_HEADER_BYTES + pixel_size
+
+    # 压缩模式检测
+    is_rle = bool(flags & 0x0002)
+    is_delta = bool(flags & 0x0004)
+    if is_rle:
+        compress_str = "RLE压缩"
+    elif is_delta:
+        compress_str = "Delta差分帧"
+    else:
+        compress_str = "无（原始RGB565）"
 
     print(f"[INFO] PXL 文件信息: {pxl.name}")
     print(f"   格式版本: {version}")
@@ -106,9 +116,13 @@ def cmd_info(args: Any) -> int:
     print(f"   帧数:     {frame_count} ({'动画' if frame_count > 1 else '静态'})")
     print(f"   帧间隔:   {frame_interval}ms")
     print(f"   循环播放: {'是' if flags & 1 else '否'}")
-    print(f"   像素数据: {pixel_size} bytes")
+    print(f"   压缩模式: {compress_str}")
+    print(f"   原始像素: {pixel_size} bytes")
     print(f"   文件大小: {file_size} bytes")
-    if file_size != expected:
+    if is_rle or is_delta:
+        ratio = (file_size / expected * 100) if expected > 0 else 0
+        print(f"   压缩率:   {ratio:.1f}% ({file_size}/{expected})")
+    elif file_size != expected:
         print(f"   [WARN] 文件大小不匹配! 期望 {expected} bytes")
     else:
         print(f"   [OK] 文件格式正确")

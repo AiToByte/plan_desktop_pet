@@ -168,12 +168,20 @@ class TokenTracker:
         return self._discovered_files
     
     def _save_cache(self):
-        """保存统计数据到缓存"""
+        """保存统计数据到缓存（原子写入，防崩溃损坏）"""
+        cache_file = "token_cache.json"
+        tmp_file = cache_file + ".tmp"
         try:
-            with open("token_cache.json", 'w') as f:
-                json.dump(self._stats_history[-1000:], f)  # 保留最近1000条
+            with open(tmp_file, 'w', encoding='utf-8') as f:
+                json.dump(self._stats_history[-1000:], f, ensure_ascii=False)
+            os.replace(tmp_file, cache_file)  # 原子替换
         except Exception as e:
             logger.warning(f"保存缓存失败: {e}")
+            try:
+                if os.path.exists(tmp_file):
+                    os.remove(tmp_file)
+            except OSError:
+                pass
     
     def _parse_log_line(self, line: str) -> Optional[Dict]:
         """解析日志行，提取Token使用信息（支持JSONL和纯文本）"""

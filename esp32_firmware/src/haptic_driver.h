@@ -73,7 +73,9 @@ private:
     uint8_t _motorType;  // 0=ERM, 1=LRA
 
     bool _writeRegister(uint8_t reg, uint8_t value);
-    uint8_t _readRegister(uint8_t reg);
+    // [FIX-BUG5] 返回bool表示是否成功，value通过引用返回
+    bool _readRegisterSafe(uint8_t reg, uint8_t& value);
+    uint8_t _readRegister(uint8_t reg);  // 保留旧接口用于非关键读取
     void _setWaveformSlot(uint8_t slot, uint8_t effectId);
 };
 

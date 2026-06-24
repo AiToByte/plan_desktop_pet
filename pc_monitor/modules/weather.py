@@ -121,12 +121,20 @@ class WeatherService:
             logger.warning(f"加载天气缓存失败: {e}")
     
     def _save_cache(self, weather: dict):
-        """保存天气缓存"""
+        """保存天气缓存（原子写入，防崩溃损坏）"""
+        tmp_file = self.cache_file + ".tmp"
         try:
-            with open(self.cache_file, 'w') as f:
-                json.dump(weather, f)
+            with open(tmp_file, 'w', encoding='utf-8') as f:
+                json.dump(weather, f, ensure_ascii=False)
+            os.replace(tmp_file, self.cache_file)  # 原子替换
         except Exception as e:
             logger.warning(f"保存天气缓存失败: {e}")
+            # 清理可能残留的临时文件
+            try:
+                if os.path.exists(tmp_file):
+                    os.remove(tmp_file)
+            except OSError:
+                pass
     
     def fetch_weather(self) -> Optional[WeatherInfo]:
         """获取天气信息
@@ -210,7 +218,7 @@ class WeatherService:
                 wind_speed=float(wind.get("speed", 0)),
                 timestamp=time.time()
             )
-        except (ValueError, KeyError, IndexError, TypeError) as e:
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError) as e:
             logger.error(f"解析天气数据失败: {e}")
             return None
     

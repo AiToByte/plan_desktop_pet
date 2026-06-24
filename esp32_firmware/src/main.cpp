@@ -165,7 +165,7 @@ void commTask(void* pvParameters) {
             }
         }
         
-        // 检查连接状态（边沿触发：仅在断连瞬间执行一次，避免每10ms狂锁reconnect）
+        // 检查连接状态（边沿触发：仅在断连瞬间执行一次清理，避免每10ms狂锁reconnect）
         static bool wasConnected = false;
         bool nowConnected = comm.isConnected();
         if (wasConnected && !nowConnected && wifi.isConnected()) {
@@ -178,6 +178,12 @@ void commTask(void* pvParameters) {
             LOG_I("连接断开(边沿触发)，已发起重连");
         }
         wasConnected = nowConnected;
+
+        // [FIX-RC] 断连后周期重连：利用reconnect()内部指数退避限流，
+        // 每次commTask循环调用reconnect()，退避间隔内会被rate-limit自动跳过
+        if (!nowConnected && wifi.isConnected()) {
+            comm.reconnect();  // 内部有 _reconnectInterval 退避保护
+        }
         
         // 定时心跳
         if (now - lastHeartbeat >= 10000) {
@@ -848,8 +854,10 @@ void parseServerData(String json) {
             LOG_I("Pixel paused");
         }
         // [FIX-BUG2] 添加 resume action，补全暂停/恢复配对
+        // 注意: PixelPlayer没有resume()方法，使用play()实现等价效果
+        // play()会设置状态为PXL_PLAYING并记录millis()，不会重置帧索引
         else if (action == "resume") {
-            pixelPlayer.resume();
+            pixelPlayer.play();
             LOG_I("Pixel resumed");
         }
     }
